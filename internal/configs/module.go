@@ -8,6 +8,7 @@ package configs
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/hashicorp/hcl/v2"
 
@@ -188,27 +189,47 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 	overrideFiles = load.filter(overrideFiles)
 
 	// Process the required_providers blocks first, to ensure that all
-	// resources have access to the correct provider FQNs
+	// resources have access to the correct provider FQNs.
+	//
+	// PROTOTYPE: multiple required_providers blocks (e.g. one per directory
+	// implicitly folded in via includes.conf) are merged on a per-provider
+	// basis rather than rejected outright. An exact duplicate of a provider
+	// entry is silently deduplicated; a discrepancy (e.g. a differing
+	// version constraint) is an error, since implicit merging must not
+	// silently resolve to a different provider version than what each
+	// directory would select standalone.
+	mod.ProviderRequirements = &RequiredProviders{
+		RequiredProviders: make(map[string]*RequiredProvider),
+	}
 	for _, file := range primaryFiles {
 		for _, r := range file.RequiredProviders {
-			if mod.ProviderRequirements != nil {
+			if mod.ProviderRequirements.DeclRange == (hcl.Range{}) {
+				mod.ProviderRequirements.DeclRange = r.DeclRange
+			}
+			for name, rp := range r.RequiredProviders {
+				existing, exists := mod.ProviderRequirements.RequiredProviders[name]
+				if !exists {
+					mod.ProviderRequirements.RequiredProviders[name] = rp
+					continue
+				}
+
+				if existing.Type == rp.Type && existing.Requirement.Required.String() == rp.Requirement.Required.String() {
+					// Exact duplicate: safe to ignore.
+					continue
+				}
+
 				diags = append(diags, &hcl.Diagnostic{
 					Severity: hcl.DiagError,
-					Summary:  "Duplicate required providers configuration",
-					Detail:   fmt.Sprintf("A module may have only one required providers configuration. The required providers were previously configured at %s.", mod.ProviderRequirements.DeclRange),
-					Subject:  &r.DeclRange,
+					Summary:  "Conflicting required providers configuration",
+					Detail: fmt.Sprintf(
+						"Provider %q was previously required as %s %q in %s, but is now required as %s %q in %s. Unlike when using explicit modules, where OpenTofu would automatically select the latest version satisfying every constraint, directories implicitly merged via includes.conf must declare exactly matching provider requirements, so that the merged configuration cannot drift from what each directory would select when run standalone.",
+						name,
+						existing.Source, existing.Requirement.Required.String(), existing.DeclRange.Filename,
+						rp.Source, rp.Requirement.Required.String(), rp.DeclRange.Filename,
+					),
+					Subject: &rp.DeclRange,
 				})
-				continue
 			}
-			mod.ProviderRequirements = r
-		}
-	}
-
-	// If no required_providers block is configured, create a useful empty
-	// state to reduce nil checks elsewhere
-	if mod.ProviderRequirements == nil {
-		mod.ProviderRequirements = &RequiredProviders{
-			RequiredProviders: make(map[string]*RequiredProvider),
 		}
 	}
 
@@ -310,6 +331,16 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	for _, b := range file.Backends {
+		// PROTOTYPE: a backend configuration is only honored when it comes
+		// from a file in this module's own directory. Backend blocks folded
+		// in from directories implicitly included via includes.conf are
+		// ignored rather than treated as a conflict, since each included
+		// directory is also expected to be usable as a standalone
+		// configuration with its own backend.
+		if filepath.Dir(b.DeclRange.Filename) != filepath.Clean(m.SourceDir) {
+			continue
+		}
+
 		if m.Backend != nil {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,

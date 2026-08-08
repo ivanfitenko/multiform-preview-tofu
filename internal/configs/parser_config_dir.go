@@ -236,6 +236,38 @@ func (p *Parser) dirFiles(dir string, testsDir string) (primary, override, tests
 		return
 	}
 
+	dirPrimary, dirOverride, dirTests := p.classifyDirEntries(dir, infos, includeTests)
+	primary = append(primary, dirPrimary...)
+	override = append(override, dirOverride...)
+	tests = append(tests, dirTests...)
+
+	// PROTOTYPE: implicitly fold the config files of any subdirectories
+	// listed in includes.conf into this directory's own file lists, as if
+	// they were colocated here.
+	for _, subDir := range p.includedDirs(dir) {
+		subInfos, err := p.fs.ReadDir(subDir)
+		if err != nil {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Failed to read included directory",
+				Detail:   fmt.Sprintf("Included directory %s does not exist or cannot be read.", subDir),
+			})
+			continue
+		}
+
+		subPrimary, subOverride, subTests := p.classifyDirEntries(subDir, subInfos, includeTests)
+		primary = append(primary, subPrimary...)
+		override = append(override, subOverride...)
+		tests = append(tests, subTests...)
+	}
+
+	return filterTfPathsWithTofuAlternatives(primary), filterTfPathsWithTofuAlternatives(override), filterTfPathsWithTofuAlternatives(tests), diags
+}
+
+// classifyDirEntries splits the entries of a single directory into primary,
+// override, and test configuration file paths, ignoring subdirectories and
+// non-configuration files.
+func (p *Parser) classifyDirEntries(dir string, infos []os.FileInfo, includeTests bool) (primary, override, tests []string) {
 	for _, info := range infos {
 		if info.IsDir() {
 			// We only care about tofu configuration files.
@@ -266,7 +298,35 @@ func (p *Parser) dirFiles(dir string, testsDir string) (primary, override, tests
 		}
 	}
 
-	return filterTfPathsWithTofuAlternatives(primary), filterTfPathsWithTofuAlternatives(override), filterTfPathsWithTofuAlternatives(tests), diags
+	return primary, override, tests
+}
+
+// includesConfFile is the name of the file, if present in a configuration
+// directory, that lists additional directories (one per line, relative to
+// that directory) whose configuration files should implicitly be folded
+// into this one.
+const includesConfFile = "includes.conf"
+
+// includedDirs reads dir's includes.conf file, if any, and returns the
+// resolved paths of the directories it lists. Blank lines and lines
+// starting with '#' are ignored. If includes.conf does not exist, it
+// returns nil.
+func (p *Parser) includedDirs(dir string) []string {
+	raw, err := p.fs.ReadFile(filepath.Join(dir, includesConfFile))
+	if err != nil {
+		return nil
+	}
+
+	var dirs []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		dirs = append(dirs, filepath.Join(dir, line))
+	}
+
+	return dirs
 }
 
 // filterTfPathsWithTofuAlternatives filters out .tf files if they have an
