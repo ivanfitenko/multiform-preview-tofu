@@ -238,9 +238,9 @@ func (p *Parser) dirFiles(dir string, testsDir string) (primary, override, tests
 	tests = append(tests, dirTests...)
 	symbols = append(symbols, dirSymbols...)
 
-	// PROTOTYPE: implicitly fold the config files of any subdirectories
-	// listed in includes.conf into this directory's own file lists, as if
-	// they were colocated here.
+	// Implicitly fold the config files of any subdirectories listed in
+	// includes.conf into this directory's own file lists, as if they were
+	// colocated here.
 	for _, subDir := range p.includedDirs(dir) {
 		subInfos, err := p.fs.ReadDir(subDir)
 		if err != nil {

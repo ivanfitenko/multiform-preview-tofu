@@ -8,12 +8,11 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 )
 
-// PROTOTYPE (variable disambiguation): this file rewrites every var.X
-// reference within an includes.conf-included directory's own files to
-// match the namespaced name applied to that directory's variable
-// declarations (see Module.VariableRenames, populated in module.go's
-// appendFile), so that similarly-named variables declared in different
-// folded-in directories (e.g. two directories each declaring
+// This file rewrites every var.X reference within an includes.conf-included
+// directory's own files to match the namespaced name applied to that
+// directory's variable declarations (see Module.VariableRenames, populated
+// in module.go's appendFile), so that similarly-named variables declared in
+// different folded-in directories (e.g. two directories each declaring
 // variable "s3_bucket") can't collide or be confused with one another once
 // flattened into a single module.
 //
