@@ -79,6 +79,20 @@ type Module struct {
 	// spliced to point directly at the real underlying resource instead of
 	// attempting a real (and likely broken) backend read.
 	KnownBackends map[string]struct{}
+
+	// PROTOTYPE (variable disambiguation): VariableRenames records, per
+	// directory, the rename applied to each variable declared in that
+	// directory when it was folded in via includes.conf (see appendFile):
+	// VariableRenames[dir][originalName] = "<namespace(dir)>_originalName".
+	// Every included directory's variables are namespaced this way
+	// unconditionally (not just on an actual name collision), so a
+	// directory's meaning of var.X can't silently change just because some
+	// other included directory later happens to declare the same name.
+	// resolveVariableReferences uses this to rewrite every var.X reference
+	// within that same directory's own files to match. The root directory
+	// (SourceDir itself) is never renamed - its variable names are the
+	// primary, user-facing interface.
+	VariableRenames map[string]map[string]string
 }
 
 // GetProviderConfig uses name and alias to find the respective Provider configuration.
@@ -263,11 +277,41 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 		diags = append(diags, fileDiags...)
 	}
 
-	// PROTOTYPE (dependency resolution, Strategy A): now that every file
-	// has been merged in, splice references to any terraform_remote_state
-	// data source pointed at one of our own folded-in directories' backends
-	// to point directly at the real underlying resource instead.
-	resolveRemoteStateReferences(mod)
+	// PROTOTYPE: both of the rewrite passes below mutate expression nodes
+	// in place - and those nodes are cached by filename inside the
+	// underlying hclparse.Parser (see hclparse.Parser.ParseHCL), shared
+	// across every call to LoadConfigFile for that path, not copied fresh
+	// per call. OpenTofu loads a directory's config in more than one pass
+	// per operation via SelectiveLoader - notably an early
+	// SelectiveLoadBackend pass whose filtered *File still carries
+	// Variables (needed for early-eval of backend config) - and that
+	// early pass's Module is discarded, but any AST mutation it performed
+	// is not: it persists in the shared cache and corrupts what the real,
+	// later SelectiveLoadAll pass then re-decodes fresh (e.g. a variable's
+	// validation block would be re-decoded with its original, unrenamed
+	// name, while its now-mutated condition expression would already
+	// reference the renamed one, tripping OpenTofu's own "condition must
+	// refer to var.X" consistency check). Gating on SelectiveLoadAll
+	// avoids ever mutating the shared AST from a pass whose results will
+	// be thrown away.
+	if load == SelectiveLoadAll {
+		// PROTOTYPE (variable disambiguation): rewrite var.X references to
+		// match the namespacing already applied to variable declarations
+		// above. This must run before resolveRemoteStateReferences: an
+		// output's expression can itself contain a var.X reference, and
+		// once that expression gets spliced into a different directory's
+		// config by the remote-state rewrite, there would be no way to
+		// tell which directory's variable it was originally meant to
+		// resolve against.
+		resolveVariableReferences(mod)
+
+		// PROTOTYPE (dependency resolution, Strategy A): now that every
+		// file has been merged in, splice references to any
+		// terraform_remote_state data source pointed at one of our own
+		// folded-in directories' backends to point directly at the real
+		// underlying resource instead.
+		resolveRemoteStateReferences(mod)
+	}
 
 	return mod, diags
 }
@@ -451,6 +495,46 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	}
 
 	for _, v := range file.Variables {
+		// PROTOTYPE (variable disambiguation): a variable folded in from an
+		// includes.conf-included subdirectory is namespaced with that
+		// directory's name, so it can never collide with a similarly named
+		// variable from another directory (or from this directory itself).
+		// See resolveVariableReferences for the corresponding var.X
+		// reference rewrite.
+		if dir := filepath.Dir(v.DeclRange.Filename); dir != filepath.Clean(m.SourceDir) {
+			// PROTOTYPE: a variable with a validation block is left
+			// un-namespaced. Renaming it would also require rewriting the
+			// var.X reference inside its own validation condition, but
+			// that reference is re-checked by OpenTofu's own "condition
+			// must refer to var.X" rule on every independent decode of
+			// this file - and the CLI decodes the same file more than
+			// once per invocation, sharing hclparse's cached AST across
+			// those decodes, so a rename applied on one decode is still
+			// visible (and now mismatched against the always-original
+			// variable name) on the next. See
+			// ~/claude/dependency-resolution-strategy-b-plan.md-adjacent
+			// notes for the full trace; this is scoped out for now rather
+			// than fixed.
+			if len(v.Validations) > 0 {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Variable cannot be disambiguated in multiform mode",
+					Detail:   fmt.Sprintf("Variable %q, folded in from %s, has a validation block that refers to itself. Multiform mode cannot currently namespace such a variable to avoid collisions with a similarly named variable from another folded-in directory (or from this directory). Remove the validation block, or rename the variable so it cannot collide, to avoid this error.", v.Name, dir),
+					Subject:  &v.DeclRange,
+				})
+			} else {
+				originalName := v.Name
+				v.Name = variableNamespace(dir) + "_" + originalName
+				if m.VariableRenames == nil {
+					m.VariableRenames = make(map[string]map[string]string)
+				}
+				if m.VariableRenames[dir] == nil {
+					m.VariableRenames[dir] = make(map[string]string)
+				}
+				m.VariableRenames[dir][originalName] = v.Name
+			}
+		}
+
 		if existing, exists := m.Variables[v.Name]; exists {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
