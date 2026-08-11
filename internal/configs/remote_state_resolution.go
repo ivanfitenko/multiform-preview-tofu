@@ -12,11 +12,11 @@ import (
 	"github.com/opentofu/opentofu/internal/addrs"
 )
 
-// PROTOTYPE (dependency resolution, Strategy A): this file recognizes when
-// a terraform_remote_state data source is pointed at the backend of a
-// directory that was implicitly folded into this module via includes.conf
-// (see Module.KnownBackends, populated in module.go's appendFile), prunes
-// it from the module, and splices every reference to it
+// This file recognizes when a terraform_remote_state data source is
+// pointed at the backend of a directory that was implicitly folded into
+// this module via includes.conf (see Module.KnownBackends, populated in
+// module.go's appendFile), prunes it from the module, and splices every
+// reference to it
 // (data.terraform_remote_state.<name>.outputs.<attr>) with the actual
 // expression that produces <attr>'s value - i.e. rewrites the config's own
 // HCL expression tree at merge time, rather than trying to redirect at the

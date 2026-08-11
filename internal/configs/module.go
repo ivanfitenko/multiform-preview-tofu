@@ -70,19 +70,19 @@ type Module struct {
 	// begin using language experiments in a later release.
 	ActiveExperiments experiments.Set
 
-	// PROTOTYPE (dependency resolution, Strategy A): KnownBackends records
-	// a canonical key (see backendConfigKey) for every backend block that
-	// was folded in from an includes.conf-included subdirectory and
-	// discarded (see appendFile). It lets resolveRemoteStateReferences
-	// recognize when a terraform_remote_state data source is pointed at
-	// one of our own folded-in directories, so references to it can be
-	// spliced to point directly at the real underlying resource instead of
-	// attempting a real (and likely broken) backend read.
+	// KnownBackends records a canonical key (see backendConfigKey) for
+	// every backend block that was folded in from an includes.conf-included
+	// subdirectory and discarded (see appendFile). It lets
+	// resolveRemoteStateReferences recognize when a terraform_remote_state
+	// data source is pointed at one of our own folded-in directories, so
+	// references to it can be spliced to point directly at the real
+	// underlying resource instead of attempting a real (and likely broken)
+	// backend read.
 	KnownBackends map[string]struct{}
 
-	// PROTOTYPE (variable disambiguation): VariableRenames records, per
-	// directory, the rename applied to each variable declared in that
-	// directory when it was folded in via includes.conf (see appendFile):
+	// VariableRenames records, per directory, the rename applied to each
+	// variable declared in that directory when it was folded in via
+	// includes.conf (see appendFile):
 	// VariableRenames[dir][originalName] = "<namespace(dir)>_originalName".
 	// Every included directory's variables are namespaced this way
 	// unconditionally (not just on an actual name collision), so a
@@ -215,7 +215,7 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 	// Process the required_providers blocks first, to ensure that all
 	// resources have access to the correct provider FQNs.
 	//
-	// PROTOTYPE: multiple required_providers blocks (e.g. one per directory
+	// Multiple required_providers blocks (e.g. one per directory
 	// implicitly folded in via includes.conf) are merged on a per-provider
 	// basis rather than rejected outright. An exact duplicate of a provider
 	// entry is silently deduplicated; a discrepancy (e.g. a differing
@@ -277,7 +277,7 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 		diags = append(diags, fileDiags...)
 	}
 
-	// PROTOTYPE: both of the rewrite passes below mutate expression nodes
+	// Both of the rewrite passes below mutate expression nodes
 	// in place - and those nodes are cached by filename inside the
 	// underlying hclparse.Parser (see hclparse.Parser.ParseHCL), shared
 	// across every call to LoadConfigFile for that path, not copied fresh
@@ -295,21 +295,20 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 	// avoids ever mutating the shared AST from a pass whose results will
 	// be thrown away.
 	if load == SelectiveLoadAll {
-		// PROTOTYPE (variable disambiguation): rewrite var.X references to
-		// match the namespacing already applied to variable declarations
-		// above. This must run before resolveRemoteStateReferences: an
-		// output's expression can itself contain a var.X reference, and
-		// once that expression gets spliced into a different directory's
-		// config by the remote-state rewrite, there would be no way to
-		// tell which directory's variable it was originally meant to
-		// resolve against.
+		// Rewrite var.X references to match the namespacing already
+		// applied to variable declarations above. This must run before
+		// resolveRemoteStateReferences: an output's expression can itself
+		// contain a var.X reference, and once that expression gets
+		// spliced into a different directory's config by the
+		// remote-state rewrite, there would be no way to tell which
+		// directory's variable it was originally meant to resolve
+		// against.
 		resolveVariableReferences(mod)
 
-		// PROTOTYPE (dependency resolution, Strategy A): now that every
-		// file has been merged in, splice references to any
-		// terraform_remote_state data source pointed at one of our own
-		// folded-in directories' backends to point directly at the real
-		// underlying resource instead.
+		// Now that every file has been merged in, splice references to
+		// any terraform_remote_state data source pointed at one of our
+		// own folded-in directories' backends to point directly at the
+		// real underlying resource instead.
 		resolveRemoteStateReferences(mod)
 	}
 
@@ -391,16 +390,15 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	for _, b := range file.Backends {
-		// PROTOTYPE: a backend configuration is only honored when it comes
-		// from a file in this module's own directory. Backend blocks folded
-		// in from directories implicitly included via includes.conf are
+		// A backend configuration is only honored when it comes from a
+		// file in this module's own directory. Backend blocks folded in
+		// from directories implicitly included via includes.conf are
 		// ignored rather than treated as a conflict, since each included
 		// directory is also expected to be usable as a standalone
 		// configuration with its own backend.
 		if filepath.Dir(b.DeclRange.Filename) != filepath.Clean(m.SourceDir) {
-			// PROTOTYPE (dependency resolution, Strategy A): remember this
-			// backend so resolveRemoteStateReferences can recognize
-			// terraform_remote_state data sources pointed at it.
+			// Remember this backend so resolveRemoteStateReferences can
+			// recognize terraform_remote_state data sources pointed at it.
 			if key, ok := backendConfigKey(b.Type, b.Config, filepath.Dir(b.DeclRange.Filename)); ok {
 				if m.KnownBackends == nil {
 					m.KnownBackends = make(map[string]struct{})
@@ -495,23 +493,22 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	}
 
 	for _, v := range file.Variables {
-		// PROTOTYPE (variable disambiguation): a variable folded in from an
-		// includes.conf-included subdirectory is namespaced with that
-		// directory's name, so it can never collide with a similarly named
-		// variable from another directory (or from this directory itself).
-		// See resolveVariableReferences for the corresponding var.X
-		// reference rewrite.
+		// A variable folded in from an includes.conf-included subdirectory
+		// is namespaced with that directory's name, so it can never
+		// collide with a similarly named variable from another directory
+		// (or from this directory itself). See resolveVariableReferences
+		// for the corresponding var.X reference rewrite.
 		if dir := filepath.Dir(v.DeclRange.Filename); dir != filepath.Clean(m.SourceDir) {
-			// PROTOTYPE: a variable with a validation block is left
-			// un-namespaced. Renaming it would also require rewriting the
-			// var.X reference inside its own validation condition, but
-			// that reference is re-checked by OpenTofu's own "condition
-			// must refer to var.X" rule on every independent decode of
-			// this file - and the CLI decodes the same file more than
-			// once per invocation, sharing hclparse's cached AST across
-			// those decodes, so a rename applied on one decode is still
-			// visible (and now mismatched against the always-original
-			// variable name) on the next. See
+			// A variable with a validation block is left un-namespaced.
+			// Renaming it would also require rewriting the var.X
+			// reference inside its own validation condition, but that
+			// reference is re-checked by OpenTofu's own "condition must
+			// refer to var.X" rule on every independent decode of this
+			// file - and the CLI decodes the same file more than once per
+			// invocation, sharing hclparse's cached AST across those
+			// decodes, so a rename applied on one decode is still visible
+			// (and now mismatched against the always-original variable
+			// name) on the next. See
 			// ~/claude/dependency-resolution-strategy-b-plan.md-adjacent
 			// notes for the full trace; this is scoped out for now rather
 			// than fixed.
