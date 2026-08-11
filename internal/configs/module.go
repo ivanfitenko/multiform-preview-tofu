@@ -69,6 +69,16 @@ type Module struct {
 	// reserved to be a place to capture a module's active experiments if we
 	// begin using language experiments in a later release.
 	ActiveExperiments experiments.Set
+
+	// PROTOTYPE (dependency resolution, Strategy A): KnownBackends records
+	// a canonical key (see backendConfigKey) for every backend block that
+	// was folded in from an includes.conf-included subdirectory and
+	// discarded (see appendFile). It lets resolveRemoteStateReferences
+	// recognize when a terraform_remote_state data source is pointed at
+	// one of our own folded-in directories, so references to it can be
+	// spliced to point directly at the real underlying resource instead of
+	// attempting a real (and likely broken) backend read.
+	KnownBackends map[string]struct{}
 }
 
 // GetProviderConfig uses name and alias to find the respective Provider configuration.
@@ -253,6 +263,12 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 		diags = append(diags, fileDiags...)
 	}
 
+	// PROTOTYPE (dependency resolution, Strategy A): now that every file
+	// has been merged in, splice references to any terraform_remote_state
+	// data source pointed at one of our own folded-in directories' backends
+	// to point directly at the real underlying resource instead.
+	resolveRemoteStateReferences(mod)
+
 	return mod, diags
 }
 
@@ -338,6 +354,15 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 		// directory is also expected to be usable as a standalone
 		// configuration with its own backend.
 		if filepath.Dir(b.DeclRange.Filename) != filepath.Clean(m.SourceDir) {
+			// PROTOTYPE (dependency resolution, Strategy A): remember this
+			// backend so resolveRemoteStateReferences can recognize
+			// terraform_remote_state data sources pointed at it.
+			if key, ok := backendConfigKey(b.Type, b.Config, filepath.Dir(b.DeclRange.Filename)); ok {
+				if m.KnownBackends == nil {
+					m.KnownBackends = make(map[string]struct{})
+				}
+				m.KnownBackends[key] = struct{}{}
+			}
 			continue
 		}
 
