@@ -72,6 +72,13 @@ func (p *Parser) LoadConfigDirSelective(path string, load SelectiveLoader) (*Mod
 	mod, modDiags := NewModule(primary, override, path, load)
 	diags = append(diags, modDiags...)
 
+	if mod != nil {
+		useStates, preferredState, mcDiags := p.multiformConfig(path)
+		diags = append(diags, mcDiags...)
+		mod.UseStates = useStates
+		mod.PreferredState = preferredState
+	}
+
 	diags = finalizeModuleLoadDiagnostics(diags)
 	return mod, diags
 }
@@ -93,6 +100,13 @@ func (p *Parser) LoadConfigDirWithTests(path string, testDirectory string) (*Mod
 
 	mod, modDiags := NewModuleWithTests(primary, override, tests, path)
 	diags = append(diags, modDiags...)
+
+	if mod != nil {
+		useStates, preferredState, mcDiags := p.multiformConfig(path)
+		diags = append(diags, mcDiags...)
+		mod.UseStates = useStates
+		mod.PreferredState = preferredState
+	}
 
 	diags = finalizeModuleLoadDiagnostics(diags)
 	return mod, diags

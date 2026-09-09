@@ -75,15 +75,20 @@ type Module struct {
 	LanguageExperiments      experiments.Set
 	LanguageExperimentsRange hcl.Range
 
-	// KnownBackends records a canonical key (see backendConfigKey) for
-	// every backend block that was folded in from an includes.conf-included
-	// subdirectory and discarded (see appendFile). It lets
-	// resolveRemoteStateReferences recognize when a terraform_remote_state
-	// data source is pointed at one of our own folded-in directories, so
-	// references to it can be spliced to point directly at the real
-	// underlying resource instead of attempting a real (and likely broken)
-	// backend read.
-	KnownBackends map[string]struct{}
+	// KnownBackends records, keyed by a canonical key (see
+	// backendConfigKey), every backend block that was folded in from an
+	// includes.conf-included subdirectory and discarded (see appendFile).
+	// It serves two purposes: resolveRemoteStateReferences uses the key to
+	// recognize when a terraform_remote_state data source is pointed at
+	// one of our own folded-in directories, so references to it can be
+	// spliced to point directly at the real underlying resource instead of
+	// attempting a real (and likely broken) backend read; and the
+	// multiform state-handling mode (see Module.UseStates/PreferredState)
+	// uses the retained *Backend itself (its Type, Config body, and
+	// DeclRange, from which the owning directory can be recovered via
+	// filepath.Dir) to actually instantiate that directory's own backend
+	// when reading or writing its local state.
+	KnownBackends map[string]*Backend
 
 	// VariableRenames records, per directory, the rename applied to each
 	// variable declared in that directory when it was folded in via
@@ -98,6 +103,19 @@ type Module struct {
 	// (SourceDir itself) is never renamed - its variable names are the
 	// primary, user-facing interface.
 	VariableRenames map[string]map[string]string
+
+	// UseStates and PreferredState carry this module's own directory's
+	// config.cfg directives (see Parser.multiformConfig in
+	// multiform_config.go). UseStates controls which backend(s) get
+	// written to on apply: the root's own backend ("global"), each
+	// folded-in directory's own backend ("local"), or both
+	// ("global_and_local"). PreferredState controls which state is read
+	// as the planning baseline: the root's own backend's state ("global")
+	// or the state assembled from folded-in directories' own backends
+	// ("local"). Both default to "global", matching pre-multiform
+	// behavior, when config.cfg is absent or a directive isn't set.
+	UseStates      string
+	PreferredState string
 }
 
 // GetProviderConfig uses name and alias to find the respective Provider configuration.
@@ -378,6 +396,12 @@ func (m *Module) Finalize(l symlib.Table, call StaticModuleCall) hcl.Diagnostics
 		// We don't know the backend type / loader at this point so we save the context for later use
 		m.Backend.Eval = m.StaticEvaluator
 	}
+	for _, knownBackend := range m.KnownBackends {
+		// Folded-in directories' own backends need the same wiring as
+		// m.Backend above, since the multiform state-handling mode may
+		// later need to Decode() their config to instantiate them.
+		knownBackend.Eval = m.StaticEvaluator
+	}
 	if m.CloudConfig != nil {
 		m.CloudConfig.eval = m.StaticEvaluator
 	}
@@ -449,9 +473,9 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 			// recognize terraform_remote_state data sources pointed at it.
 			if key, ok := backendConfigKey(b.Type, b.Config, filepath.Dir(b.DeclRange.Filename)); ok {
 				if m.KnownBackends == nil {
-					m.KnownBackends = make(map[string]struct{})
+					m.KnownBackends = make(map[string]*Backend)
 				}
-				m.KnownBackends[key] = struct{}{}
+				m.KnownBackends[key] = b
 			}
 			continue
 		}
