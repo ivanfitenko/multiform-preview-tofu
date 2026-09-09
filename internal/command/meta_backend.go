@@ -480,6 +480,7 @@ func (m *Meta) Operation(ctx context.Context, b backend.Backend, view views.Back
 		Workspace:       workspace,
 		StateLocker:     stateLocker,
 		DependencyLocks: depLocks,
+		BackendResolver: backendInit.Backend,
 	}
 }
 

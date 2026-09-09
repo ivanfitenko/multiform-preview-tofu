@@ -331,6 +331,18 @@ type Operation struct {
 	// for unmatched import targets and where any generated config should be
 	// written to.
 	GenerateConfigOut string
+
+	// BackendResolver resolves a backend type name to its constructor and
+	// canonical type name - the same signature as internal/backend/init's
+	// Backend function. It's threaded in from the command layer (which can
+	// import that registry) so that internal/backend/local can instantiate
+	// the backends of includes.conf-included directories for multiform's
+	// local state-handling modes (see configs.Module's UseStates and
+	// PreferredState) without itself depending on the registry, which
+	// imports internal/backend/local and so can never be imported back
+	// from there. May be nil if the caller doesn't need multiform local
+	// state-handling support.
+	BackendResolver func(name string) (InitFn, string)
 }
 
 // HasConfig returns true if and only if the operation has a ConfigDir value

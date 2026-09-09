@@ -17,6 +17,7 @@ import (
 	"github.com/opentofu/opentofu/internal/addrs"
 	"github.com/opentofu/opentofu/internal/backend"
 	"github.com/opentofu/opentofu/internal/command/views"
+	"github.com/opentofu/opentofu/internal/configs"
 	"github.com/opentofu/opentofu/internal/logging"
 	"github.com/opentofu/opentofu/internal/plans"
 	"github.com/opentofu/opentofu/internal/states"
@@ -289,19 +290,40 @@ func (b *Local) opApply(
 
 	// Store the final state
 	runningOp.State = applyState
-	err := statemgr.WriteAndPersist(context.TODO(), opState, applyState, schemas)
-	if err != nil {
-		// Export the state file from the state manager and assign the new
-		// state. This is needed to preserve the existing serial and lineage.
-		stateFile := statemgr.Export(opState)
-		if stateFile == nil {
-			stateFile = &statefile.File{}
-		}
-		stateFile.State = applyState
 
-		diags = diags.Append(b.backupStateForError(stateFile, err, op.View))
-		op.ReportResult(runningOp, diags)
-		return
+	// use_states (see configs.Module.UseStates, set from config.cfg)
+	// controls which backend(s) get written: the primary/global backend
+	// (the pre-multiform default), each includes.conf-included directory's
+	// own backend, or both.
+	useStates := configs.UseStatesGlobal
+	if lr.Config != nil && lr.Config.Module != nil {
+		useStates = lr.Config.Module.UseStates
+	}
+
+	if useStates != configs.UseStatesLocal {
+		err := statemgr.WriteAndPersist(context.TODO(), opState, applyState, schemas)
+		if err != nil {
+			// Export the state file from the state manager and assign the new
+			// state. This is needed to preserve the existing serial and lineage.
+			stateFile := statemgr.Export(opState)
+			if stateFile == nil {
+				stateFile = &statefile.File{}
+			}
+			stateFile.State = applyState
+
+			diags = diags.Append(b.backupStateForError(stateFile, err, op.View))
+			op.ReportResult(runningOp, diags)
+			return
+		}
+	}
+
+	if useStates == configs.UseStatesLocal || useStates == configs.UseStatesGlobalAndLocal {
+		localDiags := writeKnownBackendStates(ctx, op, lr.Config.Module, applyState, schemas, b.encryption)
+		diags = diags.Append(localDiags)
+		if localDiags.HasErrors() {
+			op.ReportResult(runningOp, diags)
+			return
+		}
 	}
 
 	if applyDiags.HasErrors() {
