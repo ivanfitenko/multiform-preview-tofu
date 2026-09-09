@@ -18,6 +18,7 @@ import (
 	"github.com/opentofu/opentofu/internal/configs"
 	"github.com/opentofu/opentofu/internal/configs/configload"
 	"github.com/opentofu/opentofu/internal/plans/planfile"
+	"github.com/opentofu/opentofu/internal/states"
 	"github.com/opentofu/opentofu/internal/states/statemgr"
 	"github.com/opentofu/opentofu/internal/tfdiags"
 	"github.com/opentofu/opentofu/internal/tofu"
@@ -218,9 +219,22 @@ func (b *Local) localRunDirect(ctx context.Context, op *backend.Operation, run *
 		SuppressForgetErrorsDuringDestroy: op.SuppressForgetErrorsDuringDestroy,
 	}
 
-	// For a "direct" local run, the input state is the most recently stored
-	// snapshot, from the previous run.
-	state := s.State()
+	// For a "direct" local run, the input state is normally the most
+	// recently stored snapshot from the primary backend. In multiform's
+	// "local" preferred_state mode, it's instead assembled by merging the
+	// current state of each includes.conf-included directory's own
+	// backend (see configs.Module.PreferredState, mergeKnownBackendStates).
+	var state *states.State
+	if config.Module.PreferredState == configs.PreferredStateLocal {
+		mergedState, mergeDiags := mergeKnownBackendStates(ctx, op, config.Module, b.encryption)
+		diags = diags.Append(mergeDiags)
+		if mergeDiags.HasErrors() {
+			return nil, nil, diags
+		}
+		state = mergedState
+	} else {
+		state = s.State()
+	}
 	if state != nil {
 		migratedState, migrateDiags := tofumigrate.MigrateStateProviderAddresses(config, state)
 		diags = diags.Append(migrateDiags)
