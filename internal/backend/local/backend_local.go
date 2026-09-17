@@ -183,17 +183,39 @@ func (b *Local) localRunDirect(ctx context.Context, stopCtx context.Context, op 
 		))
 	}
 
+	// includes.conf-included directories' own tfvars files are otherwise
+	// invisible to OpenTofu's normal auto-loading (which only ever scans
+	// the invocation directory) - fold their values in here, as the
+	// lowest-precedence real source: anything already set via env vars,
+	// the root's own tfvars files, or -var/-var-file (all already present
+	// in op.Variables at this point) wins over them.
+	dirTfvars, dirTfvarsDiags := collectDirTfvars(config.Module)
+	diags = diags.Append(dirTfvarsDiags)
+	if dirTfvarsDiags.HasErrors() {
+		return nil, nil, diags
+	}
+	givenVariables := op.Variables
+	if len(dirTfvars) > 0 {
+		givenVariables = make(map[string]backend.UnparsedVariableValue, len(dirTfvars)+len(op.Variables))
+		for name, v := range dirTfvars {
+			givenVariables[name] = v
+		}
+		for name, v := range op.Variables {
+			givenVariables[name] = v
+		}
+	}
+
 	var rawVariables map[string]backend.UnparsedVariableValue
 	if op.AllowUnsetVariables {
 		// Rather than prompting for input, we'll just stub out the required
 		// but unset variables with unknown values to represent that they are
 		// placeholders for values the user would need to provide for other
 		// operations.
-		rawVariables = b.stubUnsetRequiredVariables(op.Variables, config.Module.Variables)
+		rawVariables = b.stubUnsetRequiredVariables(givenVariables, config.Module.Variables)
 	} else {
 		// If interactive input is enabled, we might gather some more variable
 		// values through interactive prompts.
-		rawVariables = b.interactiveCollectVariables(stopCtx, op.Variables, config.Module.Variables, op.UIIn)
+		rawVariables = b.interactiveCollectVariables(stopCtx, givenVariables, config.Module.Variables, op.UIIn)
 	}
 
 	variables, varDiags := backend.ParseVariableValues(rawVariables, config.Module.Variables)
