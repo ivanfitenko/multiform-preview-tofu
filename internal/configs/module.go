@@ -114,6 +114,14 @@ type Module struct {
 	// unlike VariableRenames it isn't exported.
 	foldedVariablesByOriginalName map[string]*Variable
 
+	// pendingCrossDirEqualities accumulates provider/data/output cross-
+	// directory dedup comparisons that appendFile couldn't decide
+	// immediately because they hinge on a bare var.X reference - see
+	// pendingCrossDirEquality and resolvePendingCrossDirEqualities in
+	// cross_dir_dedup.go. Purely internal bookkeeping, resolved (and
+	// irrelevant afterward) once the module is fully built.
+	pendingCrossDirEqualities []pendingCrossDirEquality
+
 	// UseStates and PreferredState carry this module's own directory's
 	// config.cfg directives (see Parser.multiformConfig in
 	// multiform_config.go). UseStates controls which backend(s) get
@@ -377,6 +385,12 @@ func NewModule(primaryFiles, overrideFiles []*File, call StaticModuleCall, sourc
 		mod.CloudConfig.eval = mod.StaticEvaluator
 	}
 
+	// Finalize any provider/data/output cross-directory dedup comparisons
+	// appendFile deferred (see pendingCrossDirEquality) - this needs
+	// mod.StaticEvaluator, just assigned above, to actually evaluate each
+	// deferred expression for real.
+	diags = append(diags, mod.resolvePendingCrossDirEqualities(context.TODO())...)
+
 	// Process all module calls now that we have the static context
 	for _, mc := range mod.ModuleCalls {
 		mDiags := mc.decodeStaticFields(context.TODO(), mod.StaticEvaluator)
@@ -497,25 +511,42 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 			// merged configuration behaving differently than each
 			// directory would standalone. See providerConfigsEqual.
 			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(pc.DeclRange.Filename) {
-				if providerConfigsEqual(existing.Config, pc.Config) {
-					continue
-				}
-				if existing.Alias == "" {
-					diags = append(diags, &hcl.Diagnostic{
-						Severity: hcl.DiagError,
-						Summary:  "Conflicting provider configuration",
-						Detail:   fmt.Sprintf("A default (non-aliased) provider configuration for %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching provider configurations, so that the merged configuration cannot drift from what each directory would use when run standalone.", existing.Name, existing.DeclRange),
-						Subject:  &pc.DeclRange,
-					})
-				} else {
-					diags = append(diags, &hcl.Diagnostic{
+				makeConflict := func() *hcl.Diagnostic {
+					if existing.Alias == "" {
+						return &hcl.Diagnostic{
+							Severity: hcl.DiagError,
+							Summary:  "Conflicting provider configuration",
+							Detail:   fmt.Sprintf("A default (non-aliased) provider configuration for %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching provider configurations, so that the merged configuration cannot drift from what each directory would use when run standalone.", existing.Name, existing.DeclRange),
+							Subject:  &pc.DeclRange,
+						}
+					}
+					return &hcl.Diagnostic{
 						Severity: hcl.DiagError,
 						Summary:  "Conflicting provider configuration",
 						Detail:   fmt.Sprintf("A provider configuration for %q with alias %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching provider configurations, so that the merged configuration cannot drift from what each directory would use when run standalone.", existing.Name, existing.Alias, existing.DeclRange),
 						Subject:  &pc.DeclRange,
-					})
+					}
 				}
-				continue
+
+				r := providerConfigsEqual(existing.Config, pc.Config)
+				switch {
+				case r.decided() && r.equal:
+					continue
+				case r.decided():
+					diags = append(diags, makeConflict())
+					continue
+				default:
+					m.pendingCrossDirEqualities = append(m.pendingCrossDirEqualities, pendingCrossDirEquality{
+						exprPairs: r.pending,
+						ident: StaticIdentifier{
+							Module:    addrs.RootModule,
+							Subject:   fmt.Sprintf("provider.%s", pc.Name),
+							DeclRange: pc.DeclRange,
+						},
+						conflict: makeConflict,
+					})
+					continue
+				}
 			}
 
 			if existing.Alias == "" {
@@ -681,16 +712,34 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 			// rejected, mirroring provider configuration deduplication. A
 			// discrepancy is still an error.
 			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(o.DeclRange.Filename) {
-				if outputsEqual(existing, o) {
+				makeConflict := func() *hcl.Diagnostic {
+					return &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Conflicting output definition",
+						Detail:   fmt.Sprintf("An output named %q was already defined at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching outputs to be treated as the same output; rename one of them if they are meant to be distinct.", existing.Name, existing.DeclRange),
+						Subject:  &o.DeclRange,
+					}
+				}
+
+				r := outputsEqual(existing, o)
+				switch {
+				case r.decided() && r.equal:
+					continue
+				case r.decided():
+					diags = append(diags, makeConflict())
+					continue
+				default:
+					m.pendingCrossDirEqualities = append(m.pendingCrossDirEqualities, pendingCrossDirEquality{
+						exprPairs: r.pending,
+						ident: StaticIdentifier{
+							Module:    addrs.RootModule,
+							Subject:   fmt.Sprintf("output.%s", o.Name),
+							DeclRange: o.DeclRange,
+						},
+						conflict: makeConflict,
+					})
 					continue
 				}
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Conflicting output definition",
-					Detail:   fmt.Sprintf("An output named %q was already defined at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching outputs to be treated as the same output; rename one of them if they are meant to be distinct.", existing.Name, existing.DeclRange),
-					Subject:  &o.DeclRange,
-				})
-				continue
 			}
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
@@ -759,16 +808,34 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 			// configuration deduplication. A discrepancy is still an
 			// error.
 			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(r.DeclRange.Filename) {
-				if dataResourcesEqual(existing, r) {
+				makeConflict := func() *hcl.Diagnostic {
+					return &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  fmt.Sprintf("Conflicting data %q configuration", existing.Type),
+						Detail:   fmt.Sprintf("A %s data resource named %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching data resources to be treated as the same data resource.", existing.Type, existing.Name, existing.DeclRange),
+						Subject:  &r.DeclRange,
+					}
+				}
+
+				res := dataResourcesEqual(existing, r)
+				switch {
+				case res.decided() && res.equal:
+					continue
+				case res.decided():
+					diags = append(diags, makeConflict())
+					continue
+				default:
+					m.pendingCrossDirEqualities = append(m.pendingCrossDirEqualities, pendingCrossDirEquality{
+						exprPairs: res.pending,
+						ident: StaticIdentifier{
+							Module:    addrs.RootModule,
+							Subject:   fmt.Sprintf("data.%s.%s", r.Type, r.Name),
+							DeclRange: r.DeclRange,
+						},
+						conflict: makeConflict,
+					})
 					continue
 				}
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  fmt.Sprintf("Conflicting data %q configuration", existing.Type),
-					Detail:   fmt.Sprintf("A %s data resource named %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching data resources to be treated as the same data resource.", existing.Type, existing.Name, existing.DeclRange),
-					Subject:  &r.DeclRange,
-				})
-				continue
 			}
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
