@@ -1,0 +1,7 @@
+# Runtime artifacts from actually running this example (tofu init/plan/
+# apply) - regenerated locally by anyone who tries it, never meant to be
+# committed.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

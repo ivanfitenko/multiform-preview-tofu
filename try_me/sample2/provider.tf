@@ -1,11 +1,12 @@
-# Provider and Terraform version requirements
-terraform {
-  required_version = ">= 1.0.0"
+provider "aws" {
+  region = var.region
+}
 
+terraform {
+  required_version = "~> 1.12.0"
   required_providers {
-    external = {
-      source  = "hashicorp/external"
-      version = ">= 2.0"
+    aws = {
+      source = "hashicorp/aws"
     }
   }
 }
