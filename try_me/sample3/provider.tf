@@ -1,3 +1,5 @@
+# TEST: identical to sample2's provider "aws" -> must dedupe by real value;
+# value only resolvable via this directory's own terraform.tfvars/variables.tf
 provider "aws" {
   region = var.region
 }

@@ -85,34 +85,22 @@ type Module struct {
 	// when reading or writing its local state.
 	KnownBackends map[string]*Backend
 
-	// VariableRenames records, per directory, the rename applied to each
-	// variable declared in that directory when it was folded in via
-	// includes.conf (see appendFile):
-	// VariableRenames[dir][originalName] = "<namespace(dir)>_originalName".
-	// Every included directory's variables are namespaced this way
-	// unconditionally (not just on an actual name collision), so a
-	// directory's meaning of var.X can't silently change just because some
-	// other included directory later happens to declare the same name.
-	// resolveVariableReferences uses this to rewrite every var.X reference
-	// within that same directory's own files to match. The root directory
-	// (SourceDir itself) is never renamed - its variable names are the
-	// primary, user-facing interface.
-	VariableRenames map[string]map[string]string
-
-	// foldedVariablesByOriginalName records, by original (pre-namespacing)
-	// variable name, the first *Variable registered under that name -
-	// whether it's the root's own (never renamed) or a folded-in
-	// directory's first encounter of that name (already renamed, with
-	// its final name reflected in Variable.Name). appendFile uses this to
-	// recognize when a later directory's identically-named variable is
-	// an exact duplicate (see variablesEqual) of one already registered
-	// from a *different* directory, in which case it's deduplicated to
-	// share that single declaration - via a VariableRenames entry
-	// pointing at the existing one - rather than being namespaced into a
-	// second, separate variable. This is purely internal bookkeeping for
-	// appendFile and isn't meaningful once the module is fully built, so
-	// unlike VariableRenames it isn't exported.
-	foldedVariablesByOriginalName map[string]*Variable
+	// KnownVariableDirs records every includes.conf-included directory
+	// that declares at least one variable, regardless of whether any of
+	// its declarations were later deduplicated away entirely (see
+	// appendFile's variable-dedup handling and variablesEqual in
+	// cross_dir_dedup.go) because they turned out to be exact duplicates
+	// of another directory's. Variables are no longer namespaced/renamed
+	// at all (each is registered under its own, single, global name -
+	// deduplicated if identical to one already registered elsewhere,
+	// or a "Conflicting variable declaration" error otherwise), so
+	// Module.Variables alone can't be used to recover "which directories
+	// declare a variable" once dedup has removed every one of some
+	// directory's entries in favor of an identical declaration kept from
+	// elsewhere. internal/backend/local's tfvars-folding (which needs to
+	// know which directories' own tfvars files to read) uses this
+	// instead.
+	KnownVariableDirs map[string]struct{}
 
 	// pendingCrossDirEqualities accumulates provider/data/output cross-
 	// directory dedup comparisons that appendFile couldn't decide
@@ -324,32 +312,16 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 	// across every call to LoadConfigFile for that path, not copied fresh
 	// per call. OpenTofu loads a directory's config in more than one pass
 	// per operation via SelectiveLoader - notably an early
-	// SelectiveLoadBackend pass whose filtered *File still carries
-	// Variables (needed for early-eval of backend config) - and that
-	// early pass's Module is discarded, but any AST mutation it performed
-	// is not: it persists in the shared cache and corrupts what the real,
-	// later SelectiveLoadAll pass then re-decodes fresh (e.g. a variable's
-	// validation block would be re-decoded with its original, unrenamed
-	// name, while its now-mutated condition expression would already
-	// reference the renamed one, tripping OpenTofu's own "condition must
-	// refer to var.X" consistency check). Gating on SelectiveLoadAll
-	// avoids ever mutating the shared AST from a pass whose results will
-	// be thrown away.
+	// SelectiveLoadBackend pass - and that early pass's Module is
+	// discarded, but any AST mutation it performed is not: it persists in
+	// the shared cache and corrupts what the real, later SelectiveLoadAll
+	// pass then re-decodes fresh. Gating on SelectiveLoadAll avoids ever
+	// mutating the shared AST from a pass whose results will be thrown
+	// away.
 	if load == SelectiveLoadAll {
-		// Rewrite var.X references to match the namespacing already
-		// applied to variable declarations above. This must run before
-		// resolveRemoteStateReferences: an output's expression can itself
-		// contain a var.X reference, and once that expression gets
-		// spliced into a different directory's config by the
-		// remote-state rewrite, there would be no way to tell which
-		// directory's variable it was originally meant to resolve
-		// against.
-		resolveVariableReferences(mod)
-
-		// Now that every file has been merged in, splice references to
-		// any terraform_remote_state data source pointed at one of our
-		// own folded-in directories' backends to point directly at the
-		// real underlying resource instead.
+		// Splice references to any terraform_remote_state data source
+		// pointed at one of our own folded-in directories' backends to
+		// point directly at the real underlying resource instead.
 		resolveRemoteStateReferences(mod)
 	}
 
@@ -596,89 +568,40 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	}
 
 	for _, v := range file.Variables {
-		// A variable folded in from an includes.conf-included subdirectory
-		// is namespaced with that directory's name, so it can never
-		// collide with a similarly named variable from another directory
-		// (or from this directory itself) - unless it's an exact
-		// duplicate (same name, same declared content - see
-		// variablesEqual) of one already registered from a *different*
-		// directory, in which case it's deduplicated to share that single
-		// declaration instead of being namespaced into a second, separate
-		// one. This mirrors how an identical provider configuration is
-		// deduplicated rather than namespaced. See resolveVariableReferences
-		// for the corresponding var.X reference rewrite.
-		dir := filepath.Dir(v.DeclRange.Filename)
-		originalName := v.Name
-		isFolded := dir != filepath.Clean(m.SourceDir)
+		if dir := filepath.Dir(v.DeclRange.Filename); dir != filepath.Clean(m.SourceDir) {
+			// Record every includes.conf-included directory that
+			// declares a variable, regardless of what happens to it
+			// below (deduplicated away, conflicting, or kept) - see
+			// Module.KnownVariableDirs.
+			if m.KnownVariableDirs == nil {
+				m.KnownVariableDirs = make(map[string]struct{})
+			}
+			m.KnownVariableDirs[dir] = struct{}{}
+		}
 
-		if isFolded {
-			// A variable with a validation block is left un-namespaced.
-			// Renaming it would also require rewriting the var.X
-			// reference inside its own validation condition, but that
-			// reference is re-checked by OpenTofu's own "condition must
-			// refer to var.X" rule on every independent decode of this
-			// file - and the CLI decodes the same file more than once per
-			// invocation, sharing hclparse's cached AST across those
-			// decodes, so a rename applied on one decode is still visible
-			// (and now mismatched against the always-original variable
-			// name) on the next. See
-			// ~/claude/dependency-resolution-strategy-b-plan.md-adjacent
-			// notes for the full trace; this is scoped out for now rather
-			// than fixed. Note this also means such a variable never
-			// reaches the dedup check below (it can't get here without
-			// either erroring or being namespaced), so it's never
-			// considered for deduplication either.
-			if len(v.Validations) > 0 {
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Variable cannot be disambiguated in multiform mode",
-					Detail:   fmt.Sprintf("Variable %q, folded in from %s, has a validation block that refers to itself. Multiform mode cannot currently namespace such a variable to avoid collisions with a similarly named variable from another folded-in directory (or from this directory). Remove the validation block, or rename the variable so it cannot collide, to avoid this error.", v.Name, dir),
-					Subject:  &v.DeclRange,
-				})
-			} else if existingVar, exists := m.foldedVariablesByOriginalName[originalName]; exists && filepath.Dir(existingVar.DeclRange.Filename) != dir {
-				if variablesEqual(existingVar, v) {
-					if m.VariableRenames == nil {
-						m.VariableRenames = make(map[string]map[string]string)
-					}
-					if m.VariableRenames[dir] == nil {
-						m.VariableRenames[dir] = make(map[string]string)
-					}
-					m.VariableRenames[dir][originalName] = existingVar.Name
+		if existing, exists := m.Variables[v.Name]; exists {
+			// A variable coinciding across two different includes.conf-
+			// folded directories (including root) is treated differently
+			// than a genuine duplicate within one directory: each
+			// directory is also expected to be usable as a standalone
+			// configuration with its own variable declaration, so an
+			// exact match (see variablesEqual) is silently deduplicated
+			// rather than rejected, mirroring provider configuration
+			// deduplication. A discrepancy is still an error, exactly as
+			// a plain duplicate declaration would be within one
+			// directory.
+			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(v.DeclRange.Filename) {
+				if variablesEqual(existing, v) {
 					continue
 				}
 				diags = append(diags, &hcl.Diagnostic{
 					Severity: hcl.DiagError,
 					Summary:  "Conflicting variable declaration",
-					Detail:   fmt.Sprintf("Variable %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching variable declarations to be treated as the same variable; rename one of them if they are meant to be distinct.", originalName, existingVar.DeclRange),
+					Detail:   fmt.Sprintf("Variable %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching variable declarations to be treated as the same variable; rename one of them if they are meant to be distinct.", existing.Name, existing.DeclRange),
 					Subject:  &v.DeclRange,
 				})
 				continue
-			} else {
-				v.Name = variableNamespace(dir) + "_" + originalName
-				if m.VariableRenames == nil {
-					m.VariableRenames = make(map[string]map[string]string)
-				}
-				if m.VariableRenames[dir] == nil {
-					m.VariableRenames[dir] = make(map[string]string)
-				}
-				m.VariableRenames[dir][originalName] = v.Name
-				if m.foldedVariablesByOriginalName == nil {
-					m.foldedVariablesByOriginalName = make(map[string]*Variable)
-				}
-				m.foldedVariablesByOriginalName[originalName] = v
 			}
-		} else {
-			// Record root's own variable too, so a later folded-in
-			// directory's exact duplicate can be deduplicated against it
-			// directly, keeping root's primary (unprefixed) name as the
-			// shared one.
-			if m.foldedVariablesByOriginalName == nil {
-				m.foldedVariablesByOriginalName = make(map[string]*Variable)
-			}
-			m.foldedVariablesByOriginalName[originalName] = v
-		}
-
-		if existing, exists := m.Variables[v.Name]; exists {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  "Duplicate variable declaration",

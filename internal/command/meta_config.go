@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/zclconf/go-cty/cty/convert"
 
 	"github.com/opentofu/opentofu/internal/addrs"
+	backendLocal "github.com/opentofu/opentofu/internal/backend/local"
 	"github.com/opentofu/opentofu/internal/configs"
 	"github.com/opentofu/opentofu/internal/configs/configload"
 	"github.com/opentofu/opentofu/internal/configs/configschema"
@@ -121,6 +123,29 @@ func (m *Meta) rootModuleCall(ctx context.Context, rootDir string) (configs.Stat
 	call := configs.NewStaticModuleCall(addrs.RootModule, hcl.Range{}, func(variable *configs.Variable) (cty.Value, hcl.Diagnostics) {
 		name := variable.Name
 		v, ok := variables[name]
+		if !ok {
+			// Early/static evaluation (e.g. multiform's cross-directory
+			// provider/data dedup comparisons - see
+			// internal/configs/cross_dir_dedup.go) runs here, before
+			// collectDirTfvars's own merge into op.Variables ever
+			// happens (that only occurs later, deep in
+			// backend_local.go's localRunDirect). Without this
+			// fallback, a folded-in directory's own required variable,
+			// whose only value comes from that same directory's own
+			// terraform.tfvars, would incorrectly appear undefined at
+			// this earlier stage even though the full run would have
+			// found it.
+			if dir := filepath.Dir(variable.DeclRange.Filename); dir != filepath.Clean(rootDir) {
+				dirVars, dirDiags := backendLocal.ReadDirTfvarsFiles(dir)
+				if dirDiags.HasErrors() {
+					return cty.NilVal, dirDiags.ToHCL()
+				}
+				if dv, found := dirVars[name]; found {
+					v = dv
+					ok = true
+				}
+			}
+		}
 		if !ok {
 			if variable.Required() {
 				// User prompts are best efforts, so we accept the input here

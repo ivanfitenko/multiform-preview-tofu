@@ -10,14 +10,14 @@ import (
 
 // This file implements a reusable "deduplicable declaration" pattern:
 // appendFile (module.go) uses it to tell whether two declarations of the
-// same name - a `provider "TYPE" { ... }` block, an `output "NAME"`, or a
-// `data "TYPE" "NAME"` block (variables are handled slightly differently;
-// see variablesEqual) - one already merged in, one just encountered,
-// possibly from two different includes.conf-folded directories (including
-// root) - declare exactly the same thing, so a coincidental duplicate
-// across two standalone-capable directories can be silently deduplicated
-// rather than rejected as a conflict (which remains the correct, unchanged
-// behavior for a genuine duplicate declared twice within one directory).
+// same name - a `provider "TYPE" { ... }` block, a `variable "NAME"`, an
+// `output "NAME"`, or a `data "TYPE" "NAME"` block - one already merged
+// in, one just encountered, possibly from two different includes.conf-
+// folded directories (including root) - declare exactly the same thing,
+// so a coincidental duplicate across two standalone-capable directories
+// can be silently deduplicated rather than rejected as a conflict (which
+// remains the correct, unchanged behavior for a genuine duplicate
+// declared twice within one directory).
 // This mirrors how required_providers conflicts are already handled: an
 // exact match is fine, any discrepancy is a hard error, since silently
 // picking one over the other could make the merged configuration behave
@@ -114,8 +114,8 @@ type exprPair struct {
 // variable-resolution pipeline (CLI -var, tfvars, env vars, defaults)
 // backend blocks already use for their own early evaluation. Must only be
 // called once mod.StaticEvaluator has been set (see NewModule); unlike
-// resolveVariableReferences/resolveRemoteStateReferences this performs no
-// AST mutation, so it's safe to call regardless of SelectiveLoader mode.
+// resolveRemoteStateReferences this performs no AST mutation, so it's
+// safe to call regardless of SelectiveLoader mode.
 func (m *Module) resolvePendingCrossDirEqualities(ctx context.Context) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 	for _, p := range m.pendingCrossDirEqualities {
@@ -258,13 +258,14 @@ func hclExprEqual(a, b hcl.Expression) eqResult {
 // a variable's Default is fully evaluated at decode time (HCL doesn't
 // allow a variable's default to reference anything else), so there's no
 // deferred-evaluation concern here. A variable with a validation block
-// (on either side) is always treated as unequal here: validations aren't
-// compared at all, since a folded-in directory's own validation-bearing
-// variable never reaches this comparison in the first place (see
-// appendFile's pre-existing "cannot be disambiguated" scope limit), and
-// conflating a validated declaration with an unvalidated one of the same
-// name is exactly the kind of mismatch that should surface as a conflict,
-// not a silent dedup.
+// (on either side) is always treated as unequal here - not because
+// comparing them would be unsafe (variables are no longer renamed at
+// all, so there's no AST-mutation risk to worry about), but simply
+// because comparing two validation blocks' condition/error-message
+// expressions for real equivalence isn't implemented; a validated
+// variable that doesn't collide by name with anything else is otherwise
+// handled completely normally (registered under its own name, no
+// restriction).
 func variablesEqual(a, b *Variable) bool {
 	if len(a.Validations) != 0 || len(b.Validations) != 0 {
 		return false
