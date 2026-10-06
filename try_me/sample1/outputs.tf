@@ -1,4 +1,5 @@
 # Outputs
+# TEST: plain output folding (unique names, no dedup/conflict involved)
 output "sample1_random_string_result" {
   description = "A randomly generated string"
   value       = random_string.example.result

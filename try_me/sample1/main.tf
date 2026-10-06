@@ -1,5 +1,6 @@
 # Main Terraform configuration
 # Generate a random string
+# TEST: plain folded resources; read by sample2/sample3 via terraform_remote_state
 
 resource "random_string" "example" {
   length  = 16
