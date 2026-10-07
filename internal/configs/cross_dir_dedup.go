@@ -116,21 +116,45 @@ type exprPair struct {
 // called once mod.StaticEvaluator has been set (see NewModule); unlike
 // resolveRemoteStateReferences this performs no AST mutation, so it's
 // safe to call regardless of SelectiveLoader mode.
+//
+// Evaluation can fail for two very different reasons, which need very
+// different treatment (see internal/configs/static_scope.go for the full
+// list of diagnostics the static evaluator can produce):
+//   - The reference is simply missing a declaration ("Undefined
+//     variable"/"Undefined local") - this is just as informative and
+//     actionable here as it is anywhere else a variable/local gets
+//     evaluated, so it's surfaced exactly as the evaluator produced it.
+//   - The expression references something that early/static evaluation
+//     fundamentally can't ever resolve regardless of declarations -
+//     e.g. a module output ("Module output not supported in static
+//     context"), a provider function, a dynamic value, a circular
+//     reference. Surfacing THOSE as-is would be actively misleading
+//     here: a user reading "Module output not supported in static
+//     context" on an output that only collides by name with another
+//     directory's would reasonably conclude multiform can't handle
+//     module outputs at all, when the real, fixable problem is just
+//     that two same-named declarations can't be proven identical. These
+//     are suppressed and treated the same as a real mismatch (eqResult's
+//     normal "not equal" outcome), falling back to the same
+//     "Conflicting ..." diagnostic a provably-different pair would get.
 func (m *Module) resolvePendingCrossDirEqualities(ctx context.Context) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 	for _, p := range m.pendingCrossDirEqualities {
 		conflicted := false
 		for _, pair := range p.exprPairs {
 			existingVal, existingDiags := m.StaticEvaluator.Evaluate(ctx, pair.existing, p.ident)
-			diags = append(diags, existingDiags...)
 			candidateVal, candidateDiags := m.StaticEvaluator.Evaluate(ctx, pair.candidate, p.ident)
-			diags = append(diags, candidateDiags...)
+
 			if existingDiags.HasErrors() || candidateDiags.HasErrors() {
-				// The real evaluator's own diagnostics (e.g. "Reference
-				// to undeclared input variable") already explain the
-				// problem - no need to also report a conflict.
+				if onlyUndefinedReferenceDiags(existingDiags) && onlyUndefinedReferenceDiags(candidateDiags) {
+					diags = append(diags, existingDiags...)
+					diags = append(diags, candidateDiags...)
+				} else {
+					conflicted = true
+				}
 				continue
 			}
+
 			if !existingVal.RawEquals(candidateVal) {
 				conflicted = true
 			}
@@ -140,6 +164,22 @@ func (m *Module) resolvePendingCrossDirEqualities(ctx context.Context) hcl.Diagn
 		}
 	}
 	return diags
+}
+
+// onlyUndefinedReferenceDiags reports whether every error-severity
+// diagnostic in diags is the static evaluator's "Undefined variable" or
+// "Undefined local" (an empty or error-free set trivially qualifies too -
+// there's nothing disqualifying it).
+func onlyUndefinedReferenceDiags(diags hcl.Diagnostics) bool {
+	for _, d := range diags {
+		if d.Severity != hcl.DiagError {
+			continue
+		}
+		if d.Summary != "Undefined variable" && d.Summary != "Undefined local" {
+			return false
+		}
+	}
+	return true
 }
 
 // eqResult is the three-way outcome of comparing two expressions or
