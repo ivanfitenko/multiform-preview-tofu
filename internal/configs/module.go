@@ -85,19 +85,30 @@ type Module struct {
 	// when reading or writing its local state.
 	KnownBackends map[string]*Backend
 
-	// VariableRenames records, per directory, the rename applied to each
-	// variable declared in that directory when it was folded in via
-	// includes.conf (see appendFile):
-	// VariableRenames[dir][originalName] = "<namespace(dir)>_originalName".
-	// Every included directory's variables are namespaced this way
-	// unconditionally (not just on an actual name collision), so a
-	// directory's meaning of var.X can't silently change just because some
-	// other included directory later happens to declare the same name.
-	// resolveVariableReferences uses this to rewrite every var.X reference
-	// within that same directory's own files to match. The root directory
-	// (SourceDir itself) is never renamed - its variable names are the
-	// primary, user-facing interface.
-	VariableRenames map[string]map[string]string
+	// KnownVariableDirs records every includes.conf-included directory
+	// that declares at least one variable, regardless of whether any of
+	// its declarations were later deduplicated away entirely (see
+	// appendFile's variable-dedup handling and variablesEqual in
+	// cross_dir_dedup.go) because they turned out to be exact duplicates
+	// of another directory's. Variables are no longer namespaced/renamed
+	// at all (each is registered under its own, single, global name -
+	// deduplicated if identical to one already registered elsewhere,
+	// or a "Conflicting variable declaration" error otherwise), so
+	// Module.Variables alone can't be used to recover "which directories
+	// declare a variable" once dedup has removed every one of some
+	// directory's entries in favor of an identical declaration kept from
+	// elsewhere. internal/backend/local's tfvars-folding (which needs to
+	// know which directories' own tfvars files to read) uses this
+	// instead.
+	KnownVariableDirs map[string]struct{}
+
+	// pendingCrossDirEqualities accumulates provider/data/output cross-
+	// directory dedup comparisons that appendFile couldn't decide
+	// immediately because they hinge on a bare var.X reference - see
+	// pendingCrossDirEquality and resolvePendingCrossDirEqualities in
+	// cross_dir_dedup.go. Purely internal bookkeeping, resolved (and
+	// irrelevant afterward) once the module is fully built.
+	pendingCrossDirEqualities []pendingCrossDirEquality
 
 	// UseStates and PreferredState carry this module's own directory's
 	// config.cfg directives (see Parser.multiformConfig in
@@ -301,32 +312,16 @@ func NewModuleUneval(primaryFiles, overrideFiles []*File, sourceDir string, load
 	// across every call to LoadConfigFile for that path, not copied fresh
 	// per call. OpenTofu loads a directory's config in more than one pass
 	// per operation via SelectiveLoader - notably an early
-	// SelectiveLoadBackend pass whose filtered *File still carries
-	// Variables (needed for early-eval of backend config) - and that
-	// early pass's Module is discarded, but any AST mutation it performed
-	// is not: it persists in the shared cache and corrupts what the real,
-	// later SelectiveLoadAll pass then re-decodes fresh (e.g. a variable's
-	// validation block would be re-decoded with its original, unrenamed
-	// name, while its now-mutated condition expression would already
-	// reference the renamed one, tripping OpenTofu's own "condition must
-	// refer to var.X" consistency check). Gating on SelectiveLoadAll
-	// avoids ever mutating the shared AST from a pass whose results will
-	// be thrown away.
+	// SelectiveLoadBackend pass - and that early pass's Module is
+	// discarded, but any AST mutation it performed is not: it persists in
+	// the shared cache and corrupts what the real, later SelectiveLoadAll
+	// pass then re-decodes fresh. Gating on SelectiveLoadAll avoids ever
+	// mutating the shared AST from a pass whose results will be thrown
+	// away.
 	if load == SelectiveLoadAll {
-		// Rewrite var.X references to match the namespacing already
-		// applied to variable declarations above. This must run before
-		// resolveRemoteStateReferences: an output's expression can itself
-		// contain a var.X reference, and once that expression gets
-		// spliced into a different directory's config by the
-		// remote-state rewrite, there would be no way to tell which
-		// directory's variable it was originally meant to resolve
-		// against.
-		resolveVariableReferences(mod)
-
-		// Now that every file has been merged in, splice references to
-		// any terraform_remote_state data source pointed at one of our
-		// own folded-in directories' backends to point directly at the
-		// real underlying resource instead.
+		// Splice references to any terraform_remote_state data source
+		// pointed at one of our own folded-in directories' backends to
+		// point directly at the real underlying resource instead.
 		resolveRemoteStateReferences(mod)
 	}
 
@@ -361,6 +356,12 @@ func NewModule(primaryFiles, overrideFiles []*File, call StaticModuleCall, sourc
 	if mod.CloudConfig != nil {
 		mod.CloudConfig.eval = mod.StaticEvaluator
 	}
+
+	// Finalize any provider/data/output cross-directory dedup comparisons
+	// appendFile deferred (see pendingCrossDirEquality) - this needs
+	// mod.StaticEvaluator, just assigned above, to actually evaluate each
+	// deferred expression for real.
+	diags = append(diags, mod.resolvePendingCrossDirEqualities(context.TODO())...)
 
 	// Process all module calls now that we have the static context
 	for _, mc := range mod.ModuleCalls {
@@ -470,6 +471,56 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	for _, pc := range file.ProviderConfigs {
 		key := pc.moduleUniqueKey()
 		if existing, exists := m.ProviderConfigs[key]; exists {
+			// A provider configuration coinciding across two different
+			// includes.conf-folded directories (including root) is
+			// treated differently than a genuine duplicate within one
+			// directory: each directory is also expected to be usable as
+			// a standalone configuration with its own provider block, so
+			// an exact match is silently deduplicated rather than
+			// rejected. A discrepancy is still an error - unlike when
+			// using modules, multiform can't silently prefer one
+			// directory's settings over another's without risking the
+			// merged configuration behaving differently than each
+			// directory would standalone. See providerConfigsEqual.
+			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(pc.DeclRange.Filename) {
+				makeConflict := func() *hcl.Diagnostic {
+					if existing.Alias == "" {
+						return &hcl.Diagnostic{
+							Severity: hcl.DiagError,
+							Summary:  "Conflicting provider configuration",
+							Detail:   fmt.Sprintf("A default (non-aliased) provider configuration for %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching provider configurations, so that the merged configuration cannot drift from what each directory would use when run standalone.", existing.Name, existing.DeclRange),
+							Subject:  &pc.DeclRange,
+						}
+					}
+					return &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Conflicting provider configuration",
+						Detail:   fmt.Sprintf("A provider configuration for %q with alias %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching provider configurations, so that the merged configuration cannot drift from what each directory would use when run standalone.", existing.Name, existing.Alias, existing.DeclRange),
+						Subject:  &pc.DeclRange,
+					}
+				}
+
+				r := providerConfigsEqual(existing.Config, pc.Config)
+				switch {
+				case r.decided() && r.equal:
+					continue
+				case r.decided():
+					diags = append(diags, makeConflict())
+					continue
+				default:
+					m.pendingCrossDirEqualities = append(m.pendingCrossDirEqualities, pendingCrossDirEquality{
+						exprPairs: r.pending,
+						ident: StaticIdentifier{
+							Module:    addrs.RootModule,
+							Subject:   fmt.Sprintf("provider.%s", pc.Name),
+							DeclRange: pc.DeclRange,
+						},
+						conflict: makeConflict,
+					})
+					continue
+				}
+			}
+
 			if existing.Alias == "" {
 				diags = append(diags, &hcl.Diagnostic{
 					Severity: hcl.DiagError,
@@ -517,46 +568,40 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	}
 
 	for _, v := range file.Variables {
-		// A variable folded in from an includes.conf-included subdirectory
-		// is namespaced with that directory's name, so it can never
-		// collide with a similarly named variable from another directory
-		// (or from this directory itself). See resolveVariableReferences
-		// for the corresponding var.X reference rewrite.
 		if dir := filepath.Dir(v.DeclRange.Filename); dir != filepath.Clean(m.SourceDir) {
-			// A variable with a validation block is left un-namespaced.
-			// Renaming it would also require rewriting the var.X
-			// reference inside its own validation condition, but that
-			// reference is re-checked by OpenTofu's own "condition must
-			// refer to var.X" rule on every independent decode of this
-			// file - and the CLI decodes the same file more than once per
-			// invocation, sharing hclparse's cached AST across those
-			// decodes, so a rename applied on one decode is still visible
-			// (and now mismatched against the always-original variable
-			// name) on the next. See
-			// ~/claude/dependency-resolution-strategy-b-plan.md-adjacent
-			// notes for the full trace; this is scoped out for now rather
-			// than fixed.
-			if len(v.Validations) > 0 {
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Variable cannot be disambiguated in multiform mode",
-					Detail:   fmt.Sprintf("Variable %q, folded in from %s, has a validation block that refers to itself. Multiform mode cannot currently namespace such a variable to avoid collisions with a similarly named variable from another folded-in directory (or from this directory). Remove the validation block, or rename the variable so it cannot collide, to avoid this error.", v.Name, dir),
-					Subject:  &v.DeclRange,
-				})
-			} else {
-				originalName := v.Name
-				v.Name = variableNamespace(dir) + "_" + originalName
-				if m.VariableRenames == nil {
-					m.VariableRenames = make(map[string]map[string]string)
-				}
-				if m.VariableRenames[dir] == nil {
-					m.VariableRenames[dir] = make(map[string]string)
-				}
-				m.VariableRenames[dir][originalName] = v.Name
+			// Record every includes.conf-included directory that
+			// declares a variable, regardless of what happens to it
+			// below (deduplicated away, conflicting, or kept) - see
+			// Module.KnownVariableDirs.
+			if m.KnownVariableDirs == nil {
+				m.KnownVariableDirs = make(map[string]struct{})
 			}
+			m.KnownVariableDirs[dir] = struct{}{}
 		}
 
 		if existing, exists := m.Variables[v.Name]; exists {
+			// A variable coinciding across two different includes.conf-
+			// folded directories (including root) is treated differently
+			// than a genuine duplicate within one directory: each
+			// directory is also expected to be usable as a standalone
+			// configuration with its own variable declaration, so an
+			// exact match (see variablesEqual) is silently deduplicated
+			// rather than rejected, mirroring provider configuration
+			// deduplication. A discrepancy is still an error, exactly as
+			// a plain duplicate declaration would be within one
+			// directory.
+			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(v.DeclRange.Filename) {
+				if variablesEqual(existing, v) {
+					continue
+				}
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Conflicting variable declaration",
+					Detail:   fmt.Sprintf("Variable %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching variable declarations to be treated as the same variable; rename one of them if they are meant to be distinct.", existing.Name, existing.DeclRange),
+					Subject:  &v.DeclRange,
+				})
+				continue
+			}
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  "Duplicate variable declaration",
@@ -581,6 +626,44 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 
 	for _, o := range file.Outputs {
 		if existing, exists := m.Outputs[o.Name]; exists {
+			// An output coinciding across two different includes.conf-
+			// folded directories (including root) is treated differently
+			// than a genuine duplicate within one directory: each
+			// directory is also expected to be usable as a standalone
+			// configuration with its own output, so an exact match (see
+			// outputsEqual) is silently deduplicated rather than
+			// rejected, mirroring provider configuration deduplication. A
+			// discrepancy is still an error.
+			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(o.DeclRange.Filename) {
+				makeConflict := func() *hcl.Diagnostic {
+					return &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Conflicting output definition",
+						Detail:   fmt.Sprintf("An output named %q was already defined at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching outputs to be treated as the same output; rename one of them if they are meant to be distinct.", existing.Name, existing.DeclRange),
+						Subject:  &o.DeclRange,
+					}
+				}
+
+				r := outputsEqual(existing, o)
+				switch {
+				case r.decided() && r.equal:
+					continue
+				case r.decided():
+					diags = append(diags, makeConflict())
+					continue
+				default:
+					m.pendingCrossDirEqualities = append(m.pendingCrossDirEqualities, pendingCrossDirEquality{
+						exprPairs: r.pending,
+						ident: StaticIdentifier{
+							Module:    addrs.RootModule,
+							Subject:   fmt.Sprintf("output.%s", o.Name),
+							DeclRange: o.DeclRange,
+						},
+						conflict: makeConflict,
+					})
+					continue
+				}
+			}
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  "Duplicate output definition",
@@ -638,6 +721,45 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	for _, r := range file.DataResources {
 		key := r.moduleUniqueKey()
 		if existing, exists := m.DataResources[key]; exists {
+			// A data resource coinciding across two different
+			// includes.conf-folded directories (including root) is
+			// treated differently than a genuine duplicate within one
+			// directory: each directory is also expected to be usable as
+			// a standalone configuration with its own data resource, so
+			// an exact match (see dataResourcesEqual) is silently
+			// deduplicated rather than rejected, mirroring provider
+			// configuration deduplication. A discrepancy is still an
+			// error.
+			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(r.DeclRange.Filename) {
+				makeConflict := func() *hcl.Diagnostic {
+					return &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  fmt.Sprintf("Conflicting data %q configuration", existing.Type),
+						Detail:   fmt.Sprintf("A %s data resource named %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching data resources to be treated as the same data resource.", existing.Type, existing.Name, existing.DeclRange),
+						Subject:  &r.DeclRange,
+					}
+				}
+
+				res := dataResourcesEqual(existing, r)
+				switch {
+				case res.decided() && res.equal:
+					continue
+				case res.decided():
+					diags = append(diags, makeConflict())
+					continue
+				default:
+					m.pendingCrossDirEqualities = append(m.pendingCrossDirEqualities, pendingCrossDirEquality{
+						exprPairs: res.pending,
+						ident: StaticIdentifier{
+							Module:    addrs.RootModule,
+							Subject:   fmt.Sprintf("data.%s.%s", r.Type, r.Name),
+							DeclRange: r.DeclRange,
+						},
+						conflict: makeConflict,
+					})
+					continue
+				}
+			}
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  fmt.Sprintf("Duplicate data %q configuration", existing.Type),
