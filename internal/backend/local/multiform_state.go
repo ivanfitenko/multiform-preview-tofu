@@ -117,16 +117,22 @@ func resolveLocalBackendPath(configVal cty.Value, baseDir string) cty.Value {
 }
 
 // mergeKnownBackendStates reads each of mod's KnownBackends' own current
-// state via its own backend, and unions their root-module resources and
-// output values into a single states.State. This is the "local"
-// preferred_state planning baseline (see configs.Module.PreferredState):
-// since folded-in directories are merged into one flat module (no module
-// nesting - that's the whole premise of multiform), each per-directory
-// state's own root-module content can be inserted directly into the
-// result's root module, with no address rewriting needed. Resource address
-// collisions between directories can't happen here: they would already
-// have been rejected as a "Duplicate resource configuration" error when
-// the directories' configs were merged (see Module.appendFile).
+// state via its own backend, and unions the whole state - not just its root
+// module - into a single states.State. This is the "local" preferred_state
+// planning baseline (see configs.Module.PreferredState): since folded-in
+// directories are merged into one flat module (no module nesting between
+// directories - that's the whole premise of multiform), each directory's
+// own root-module content can be inserted directly into the result's root
+// module, with no address rewriting needed. But a folded-in directory's own
+// configuration can still contain ordinary Terraform `module` blocks of its
+// own (completely unrelated to includes.conf folding), and resources
+// declared inside those live in a *child* module of that directory's state,
+// not its root - so every module instance in the directory's state is
+// copied over at its own address via EnsureModule, not just the root one.
+// Resource/module-call address collisions between directories can't happen
+// here: they would already have been rejected as a "Duplicate resource
+// configuration"/"Duplicate module call" error when the directories' configs
+// were merged (see Module.appendFile).
 //
 // This performs unlocked reads of each per-directory backend's state,
 // unlike the primary run backend (which op.StateLocker locks around the
@@ -137,7 +143,6 @@ func resolveLocalBackendPath(configVal cty.Value, baseDir string) cty.Value {
 func mergeKnownBackendStates(ctx context.Context, op *backend.Operation, mod *configs.Module, enc encryption.StateEncryption) (*states.State, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	merged := states.NewState()
-	mergedRoot := merged.RootModule()
 
 	for _, knownBackend := range mod.KnownBackends {
 		dirBackend, kbDiags := instantiateKnownBackend(ctx, knownBackend, op.BackendResolver, enc)
@@ -161,16 +166,17 @@ func mergeKnownBackendStates(ctx context.Context, op *backend.Operation, mod *co
 			continue
 		}
 
-		dirRoot := dirState.RootModule()
-		if dirRoot == nil {
-			continue
-		}
-
-		for key, resource := range dirRoot.Resources {
-			mergedRoot.Resources[key] = resource
-		}
-		for name, output := range dirRoot.OutputValues {
-			mergedRoot.OutputValues[name] = output
+		for _, dirModule := range dirState.Modules {
+			mergedModule := merged.EnsureModule(dirModule.Addr)
+			for key, resource := range dirModule.Resources {
+				mergedModule.Resources[key] = resource
+			}
+			for name, output := range dirModule.OutputValues {
+				mergedModule.OutputValues[name] = output
+			}
+			for name, val := range dirModule.LocalValues {
+				mergedModule.LocalValues[name] = val
+			}
 		}
 	}
 
@@ -181,11 +187,30 @@ func mergeKnownBackendStates(ctx context.Context, op *backend.Operation, mod *co
 // directory (if any) each of its resources and output values was declared
 // in, and writes each directory's own subset to that directory's own
 // backend - the "local" use_states mode (see configs.Module.UseStates).
-// Provenance is recovered the same way variable_namespacing.go and
-// remote_state_resolution.go already do: by looking up each state object's
+//
+// applyState's root module is handled the way it always has been:
+// provenance is recovered by looking up each root-level state object's
 // declaring *configs.Resource/*configs.Output and taking the directory of
-// its DeclRange.Filename, since folded-in directories are merged into one
-// flat module with no module-path distinction of their own.
+// its DeclRange.Filename, the same way variable_namespacing.go and
+// remote_state_resolution.go already do, since folded-in directories are
+// merged into one flat root module with no module-path distinction of
+// their own.
+//
+// But a folded-in directory's own configuration can still contain ordinary
+// Terraform `module` blocks of its own (completely unrelated to
+// includes.conf folding) - resources/outputs declared inside those live in
+// a *child* module of applyState, not its root, so they need their own
+// provenance logic: the first step of a child module instance's address
+// (e.g. "module.public_subnets" in "module.public_subnets.module.foo...")
+// is always a module call name declared directly in the flattened root
+// module (since includes.conf folding never nests included directories'
+// own files into a module path of their own), so looking that name up in
+// mod.ModuleCalls and taking its DeclRange's directory attributes the
+// *entire* child module instance - and everything nested inside it,
+// regardless of further depth - to one directory in one step. Module-call
+// name collisions between directories can't happen here, for the same
+// reason resource address collisions can't: see Module.appendFile's
+// "Duplicate module call" check.
 //
 // Resources/outputs belonging to the root directory itself, or to any
 // directory without a known backend, are left out of every per-directory
@@ -214,24 +239,48 @@ func writeKnownBackendStates(ctx context.Context, op *backend.Operation, mod *co
 		dirStates[dir] = states.NewState()
 	}
 
-	if root := applyState.RootModule(); root != nil {
-		for key, resource := range root.Resources {
-			configResource := mod.ResourceByAddr(resource.Addr.Resource)
-			if configResource == nil {
-				continue
+	for _, module := range applyState.Modules {
+		if module.Addr.IsRoot() {
+			for key, resource := range module.Resources {
+				configResource := mod.ResourceByAddr(resource.Addr.Resource)
+				if configResource == nil {
+					continue
+				}
+				if dirState, ok := dirStates[filepath.Dir(configResource.DeclRange.Filename)]; ok {
+					dirState.RootModule().Resources[key] = resource
+				}
 			}
-			if dirState, ok := dirStates[filepath.Dir(configResource.DeclRange.Filename)]; ok {
-				dirState.RootModule().Resources[key] = resource
+			for name, output := range module.OutputValues {
+				configOutput, ok := mod.Outputs[name]
+				if !ok {
+					continue
+				}
+				if dirState, ok := dirStates[filepath.Dir(configOutput.DeclRange.Filename)]; ok {
+					dirState.RootModule().OutputValues[name] = output
+				}
 			}
+			continue
 		}
-		for name, output := range root.OutputValues {
-			configOutput, ok := mod.Outputs[name]
-			if !ok {
-				continue
-			}
-			if dirState, ok := dirStates[filepath.Dir(configOutput.DeclRange.Filename)]; ok {
-				dirState.RootModule().OutputValues[name] = output
-			}
+
+		moduleCall, ok := mod.ModuleCalls[module.Addr[0].Name]
+		if !ok {
+			// Shouldn't be reachable: every module instance in applyState
+			// must trace back to some module call in the flattened config.
+			continue
+		}
+		dirState, ok := dirStates[filepath.Dir(moduleCall.DeclRange.Filename)]
+		if !ok {
+			continue
+		}
+		dirModule := dirState.EnsureModule(module.Addr)
+		for key, resource := range module.Resources {
+			dirModule.Resources[key] = resource
+		}
+		for name, output := range module.OutputValues {
+			dirModule.OutputValues[name] = output
+		}
+		for name, val := range module.LocalValues {
+			dirModule.LocalValues[name] = val
 		}
 	}
 
