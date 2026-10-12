@@ -433,7 +433,29 @@ func (i *ModuleInstaller) installLocalModule(ctx context.Context, req *configs.M
 	// For local sources we don't actually need to modify the
 	// filesystem at all because the parent already wrote
 	// the files we need, and so we just load up what's already here.
-	newDir := filepath.Join(parentRecord.Dir, req.SourceAddr.String())
+	//
+	// A relative local source is ordinarily resolved against the parent
+	// module's own recorded install directory (parentRecord.Dir), which is
+	// equivalent to resolving it against the directory of the file that
+	// contains this module call (req.CallRange.Filename): a module call's
+	// declaring file always lives directly inside its owning module's
+	// directory. OpenTofu's multiform patch breaks that equivalence,
+	// though: it can fold an entire other directory's files into the root
+	// module, so a module call declared in that folded-in directory's own
+	// file must resolve relative to the directory it was actually folded
+	// in from, not the true root directory that parentRecord.Dir names.
+	//
+	// The one deliberate exception is a module block inside a .tftest.hcl
+	// run block: those are always resolved relative to the root module
+	// being tested, regardless of which directory the test file itself
+	// lives in (e.g. a root-level main.tf vs. a tests/ subdirectory) -
+	// parentRecord.Dir is already correct for that case and must be left
+	// alone.
+	baseDir := parentRecord.Dir
+	if !strings.HasSuffix(req.CallRange.Filename, ".tftest.hcl") {
+		baseDir = filepath.Dir(req.CallRange.Filename)
+	}
+	newDir := filepath.Join(baseDir, req.SourceAddr.String())
 
 	log.Printf("[TRACE] ModuleInstaller: %s uses directory from parent: %s", key, newDir)
 	// it is possible that the local directory is a symlink
