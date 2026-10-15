@@ -14,3 +14,10 @@ output "sample2_random_id_result" {
 output "duplicate" {
   value = "test duplicate outputs"
 }
+
+# TEST: proves sample2's own "duplicate" variable kept its own value
+# ("sample2-own-value") despite sample3 declaring a variable with the same
+# name and a different value - see sample2/terraform.tfvars
+output "sample2_duplicate_value" {
+  value = var.duplicate
+}
