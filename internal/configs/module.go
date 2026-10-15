@@ -86,20 +86,14 @@ type Module struct {
 	KnownBackends map[string]*Backend
 
 	// KnownVariableDirs records every includes.conf-included directory
-	// that declares at least one variable, regardless of whether any of
-	// its declarations were later deduplicated away entirely (see
-	// appendFile's variable-dedup handling and variablesEqual in
-	// cross_dir_dedup.go) because they turned out to be exact duplicates
-	// of another directory's. Variables are no longer namespaced/renamed
-	// at all (each is registered under its own, single, global name -
-	// deduplicated if identical to one already registered elsewhere,
-	// or a "Conflicting variable declaration" error otherwise), so
-	// Module.Variables alone can't be used to recover "which directories
-	// declare a variable" once dedup has removed every one of some
-	// directory's entries in favor of an identical declaration kept from
-	// elsewhere. internal/backend/local's tfvars-folding (which needs to
-	// know which directories' own tfvars files to read) uses this
-	// instead.
+	// that declares at least one variable. Every folded-in directory's
+	// variables are namespaced to that directory (see
+	// variable_namespacing.go) and so always survive under their own
+	// namespaced name in Module.Variables - this is mainly a convenience
+	// so internal/backend/local's tfvars-folding (which needs to know
+	// which directories' own tfvars files to read) doesn't have to
+	// rediscover the directory list by scanning every variable's
+	// DeclRange itself.
 	KnownVariableDirs map[string]struct{}
 
 	// pendingCrossDirEqualities accumulates provider/data/output cross-
@@ -570,38 +564,19 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	for _, v := range file.Variables {
 		if dir := filepath.Dir(v.DeclRange.Filename); dir != filepath.Clean(m.SourceDir) {
 			// Record every includes.conf-included directory that
-			// declares a variable, regardless of what happens to it
-			// below (deduplicated away, conflicting, or kept) - see
-			// Module.KnownVariableDirs.
+			// declares a variable - see Module.KnownVariableDirs.
 			if m.KnownVariableDirs == nil {
 				m.KnownVariableDirs = make(map[string]struct{})
 			}
 			m.KnownVariableDirs[dir] = struct{}{}
 		}
 
+		// Every folded-in directory's variables are namespaced to that
+		// directory by the time this runs (see variable_namespacing.go),
+		// so a name collision here can only mean a genuine duplicate
+		// declared twice within the same directory (or at root) - never
+		// a coincidence between two different directories.
 		if existing, exists := m.Variables[v.Name]; exists {
-			// A variable coinciding across two different includes.conf-
-			// folded directories (including root) is treated differently
-			// than a genuine duplicate within one directory: each
-			// directory is also expected to be usable as a standalone
-			// configuration with its own variable declaration, so an
-			// exact match (see variablesEqual) is silently deduplicated
-			// rather than rejected, mirroring provider configuration
-			// deduplication. A discrepancy is still an error, exactly as
-			// a plain duplicate declaration would be within one
-			// directory.
-			if filepath.Dir(existing.DeclRange.Filename) != filepath.Dir(v.DeclRange.Filename) {
-				if variablesEqual(existing, v) {
-					continue
-				}
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Conflicting variable declaration",
-					Detail:   fmt.Sprintf("Variable %q was already declared at %s, with different settings. Unlike when using explicit modules, directories implicitly merged via includes.conf must declare exactly matching variable declarations to be treated as the same variable; rename one of them if they are meant to be distinct.", existing.Name, existing.DeclRange),
-					Subject:  &v.DeclRange,
-				})
-				continue
-			}
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  "Duplicate variable declaration",

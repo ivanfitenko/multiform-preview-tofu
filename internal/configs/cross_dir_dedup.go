@@ -10,24 +10,31 @@ import (
 
 // This file implements a reusable "deduplicable declaration" pattern:
 // appendFile (module.go) uses it to tell whether two declarations of the
-// same name - a `provider "TYPE" { ... }` block, a `variable "NAME"`, an
-// `output "NAME"`, or a `data "TYPE" "NAME"` block - one already merged
-// in, one just encountered, possibly from two different includes.conf-
-// folded directories (including root) - declare exactly the same thing,
-// so a coincidental duplicate across two standalone-capable directories
-// can be silently deduplicated rather than rejected as a conflict (which
-// remains the correct, unchanged behavior for a genuine duplicate
-// declared twice within one directory).
+// same name - a `provider "TYPE" { ... }` block, an `output "NAME"`, or a
+// `data "TYPE" "NAME"` block - one already merged in, one just
+// encountered, possibly from two different includes.conf-folded
+// directories (including root) - declare exactly the same thing, so a
+// coincidental duplicate across two standalone-capable directories can be
+// silently deduplicated rather than rejected as a conflict (which remains
+// the correct, unchanged behavior for a genuine duplicate declared twice
+// within one directory).
 // This mirrors how required_providers conflicts are already handled: an
 // exact match is fine, any discrepancy is a hard error, since silently
 // picking one over the other could make the merged configuration behave
 // differently than either directory would standalone.
 //
-// Deliberately NOT included: `resource` and `module` blocks. Nothing here
-// generalizes to those by design - they have their own identity (state,
-// lifecycle) that makes "silently treat two as one" a different, much
-// riskier question than it is for a provider/data/output/variable
-// declaration.
+// Deliberately NOT included: `resource` and `module` blocks, for the same
+// reason as always - they have their own identity (state, lifecycle) that
+// makes "silently treat two as one" a different, much riskier question
+// than it is for a provider/data/output declaration. ALSO deliberately
+// NOT included (not ever excluded by design, but no longer applicable):
+// `variable` blocks - every folded-in directory's variables are
+// unconditionally namespaced to that directory (see
+// variable_namespacing.go), so two directories can never end up with a
+// colliding variable *name* in the first place, and there is nothing left
+// to deduplicate. This used to compare variable declarations for dedup
+// purposes too (see variablesEqual, since removed) before namespacing
+// was reinstated.
 //
 // The pattern has two layers, so that adding a new dedupable declaration
 // kind later only means writing one new small `fooEqual` function plus
@@ -42,10 +49,10 @@ import (
 //     bookkeeping and post-pass, parameterized via a closure so it never
 //     needs to know what kind of declaration it's resolving).
 //   - One small kind-specific `fooEqual` function per declaration kind
-//     (variablesEqual, outputsEqual, dataResourcesEqual, and
-//     providerConfigsEqual doubling as the provider-block comparison)
-//     that lists just the fields particular to that kind and delegates
-//     to the generic core for anything expression/body-shaped.
+//     (outputsEqual, dataResourcesEqual, and providerConfigsEqual
+//     doubling as the provider-block comparison) that lists just the
+//     fields particular to that kind and delegates to the generic core
+//     for anything expression/body-shaped.
 //
 // WHY A THIRD ("PENDING") OUTCOME IS NEEDED, NOT JUST A BOOL, AND WHY IT'S
 // RESOLVED BY REAL EVALUATION RATHER THAN A STRUCTURAL GUESS:
@@ -290,48 +297,6 @@ func hclExprEqual(a, b hcl.Expression) eqResult {
 		return eqEqual()
 	}
 	return eqNotEqual()
-}
-
-// variablesEqual reports whether a and b are equivalent `variable`
-// declarations for cross-directory deduplication purposes. Unlike
-// provider/data/output comparisons, this is always immediately decidable:
-// a variable's Default is fully evaluated at decode time (HCL doesn't
-// allow a variable's default to reference anything else), so there's no
-// deferred-evaluation concern here. A variable with a validation block
-// (on either side) is always treated as unequal here - not because
-// comparing them would be unsafe (variables are no longer renamed at
-// all, so there's no AST-mutation risk to worry about), but simply
-// because comparing two validation blocks' condition/error-message
-// expressions for real equivalence isn't implemented; a validated
-// variable that doesn't collide by name with anything else is otherwise
-// handled completely normally (registered under its own name, no
-// restriction).
-func variablesEqual(a, b *Variable) bool {
-	if len(a.Validations) != 0 || len(b.Validations) != 0 {
-		return false
-	}
-	if a.Description != b.Description || a.DescriptionSet != b.DescriptionSet {
-		return false
-	}
-	if a.Sensitive != b.Sensitive || a.SensitiveSet != b.SensitiveSet {
-		return false
-	}
-	if a.Deprecated != b.Deprecated {
-		return false
-	}
-	if a.Ephemeral != b.Ephemeral || a.EphemeralSet != b.EphemeralSet {
-		return false
-	}
-	if a.Nullable != b.Nullable || a.NullableSet != b.NullableSet {
-		return false
-	}
-	if a.ParsingMode != b.ParsingMode {
-		return false
-	}
-	if !a.Type.Equals(b.Type) || !a.ConstraintType.Equals(b.ConstraintType) {
-		return false
-	}
-	return a.Default.RawEquals(b.Default)
 }
 
 // outputsEqual reports whether a and b are equivalent `output`
