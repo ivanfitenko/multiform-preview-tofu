@@ -80,25 +80,32 @@ func namespaceFoldedInFile(body hcl.Body, namespace string) {
 }
 
 // namespacePrefix returns the prefix namespaceFoldedInFile adds to every
-// renamed identifier, factored out so the idempotency check in
-// namespaceBody/namespaceExpr below can't drift out of sync with it.
+// renamed identifier.
 func namespacePrefix(namespace string) string {
 	return namespace + "_"
 }
 
+// namespaceBody is called at most once per file (see
+// Parser.namespacedFiles) - it does not need to guard against being run
+// twice on the same body itself, and deliberately doesn't try to: an
+// earlier version checked whether a name already had the target prefix
+// before renaming it, intending that as an idempotency guard, but that
+// check is unsound - a folded-in directory's own pre-existing variable
+// can easily already be named e.g. "ingress_external_domain" (a common
+// hand-rolled collision-avoidance convention in real pre-multiform
+// projects), which would be wrongly mistaken for an already-namespaced
+// "external_domain" and skipped, leaving its declaration un-namespaced
+// while terraform.tfvars values for it still get (correctly) re-keyed
+// with the namespace prefix elsewhere - a real, reported bug where the
+// two sides disagreed on the final name and the variable's value was
+// never found.
 func namespaceBody(body *hclsyntax.Body, namespace string) {
 	prefix := namespacePrefix(namespace)
 	for _, attr := range body.Attributes {
 		namespaceExpr(attr.Expr, namespace)
 	}
 	for _, block := range body.Blocks {
-		if block.Type == "variable" && len(block.Labels) == 1 && !strings.HasPrefix(block.Labels[0], prefix) {
-			// The same file can be parsed and decoded more than once
-			// during a single CLI invocation (e.g. once for early/static
-			// evaluation, once for the full decode), sharing the same
-			// underlying AST nodes - without this check, a second pass
-			// over an already-rewritten body would stack another prefix
-			// on top of the first, compounding on each additional pass.
+		if block.Type == "variable" && len(block.Labels) == 1 {
 			block.Labels[0] = prefix + block.Labels[0]
 		}
 		namespaceBody(block.Body, namespace)
@@ -129,11 +136,6 @@ func namespaceExpr(expr hcl.Expression, namespace string) {
 		}
 		attr, ok := t[1].(hcl.TraverseAttr)
 		if !ok {
-			continue
-		}
-		if strings.HasPrefix(attr.Name, prefix) {
-			// Already rewritten by an earlier pass over this same AST -
-			// see the comment in namespaceBody.
 			continue
 		}
 		t[1] = hcl.TraverseAttr{Name: prefix + attr.Name, SrcRange: attr.SrcRange}

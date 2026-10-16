@@ -22,6 +22,22 @@ import (
 type Parser struct {
 	fs afero.Afero
 	p  *hclparse.Parser
+
+	// namespacedFiles records, by file path, which files have already had
+	// variable_namespacing.go's rewrite applied - see
+	// loadConfigFileNamespaced. One Parser is reused for the whole
+	// lifetime of a CLI invocation (cached on Meta.configLoader), but
+	// LoadConfigDir-family methods can run more than once within that
+	// single invocation (e.g. once for early/static evaluation, once for
+	// the full decode), re-loading the same file and sharing its
+	// underlying cached AST - this must be tracked by file identity, not
+	// by inspecting whether a name already looks namespaced: a folded-in
+	// directory's own pre-existing variable happening to already be
+	// named e.g. "ingress_external_domain" (a common hand-rolled
+	// collision-avoidance convention in real pre-multiform projects)
+	// would otherwise be mistaken for an already-namespaced
+	// "external_domain" and incorrectly skipped.
+	namespacedFiles map[string]bool
 }
 
 // NewParser creates and returns a new Parser that reads files from the given
@@ -33,8 +49,9 @@ func NewParser(fs afero.Fs) *Parser {
 	}
 
 	return &Parser{
-		fs: afero.Afero{Fs: fs},
-		p:  hclparse.NewParser(),
+		fs:              afero.Afero{Fs: fs},
+		p:               hclparse.NewParser(),
+		namespacedFiles: make(map[string]bool),
 	}
 }
 

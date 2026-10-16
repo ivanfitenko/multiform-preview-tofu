@@ -63,13 +63,22 @@ func (p *Parser) loadConfigFile(path string, override bool) (*File, hcl.Diagnost
 // belonging to a directory folded in via includes.conf, so its variables
 // can never collide with another folded-in directory's (or root's) same-
 // named variables.
+//
+// The namespacing rewrite is applied at most once per file path, tracked
+// via Parser.namespacedFiles - see its doc comment for why this has to be
+// tracked by file identity rather than by inspecting the rewritten names
+// themselves.
 func (p *Parser) loadConfigFileNamespaced(path string, override bool, namespace string) (*File, hcl.Diagnostics) {
 	body, diags := p.LoadHCLFile(path)
 	if body == nil {
 		return nil, diags
 	}
-	if namespace != "" {
+	if namespace != "" && !p.namespacedFiles[path] {
 		namespaceFoldedInFile(body, namespace)
+		if p.namespacedFiles == nil {
+			p.namespacedFiles = make(map[string]bool)
+		}
+		p.namespacedFiles[path] = true
 	}
 	ret, moreDiags := loadConfigFileBody(body, path, override)
 	diags = append(diags, moreDiags...)
