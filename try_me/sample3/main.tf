@@ -10,7 +10,7 @@ data "terraform_remote_state" "sample1" {
   }
 }
 
-# TEST: local value referencing a (deduped) variable
+# TEST: local value referencing sample3's own namespaced "region" variable
 locals {
   variable_test = var.region
 }

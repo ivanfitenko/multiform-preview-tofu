@@ -24,10 +24,21 @@ import (
 // single directory the CLI was invoked from, never recursing into
 // subdirectories. Without this, any value set only in a folded-in
 // directory's own terraform.tfvars would be silently ignored, even though
-// that same directory's own variable *declarations* are folded in (see
-// internal/configs/module.go's appendFile and cross_dir_dedup.go's
-// variablesEqual - deduplicated if identical to one declared elsewhere,
-// a hard error if not, but never renamed).
+// that same directory's own variable *declarations* are folded in.
+//
+// Every folded-in directory's variables are namespaced to that directory
+// (see internal/configs/variable_namespacing.go) - a variable named
+// "region" in two different directories becomes two entirely distinct
+// variables once flattened, each only ever satisfiable by its own
+// directory's own tfvars (or the root's own tfvars/-var under the
+// namespaced name - see below). A directory's own terraform.tfvars file
+// is written using the plain, undecorated name the user always used
+// (namespacing is an internal multiform detail the user never needs to
+// know about), so every value read from it here is re-keyed to the
+// namespaced name before being handed anywhere else - this is what
+// actually fixes the "one directory's tfvars value silently overrides
+// another's" bug: once names can't collide across directories, there's
+// nothing left to silently overwrite.
 //
 // Precedence: values collected here are the LOWEST-precedence real
 // source - lower than TF_VAR_* environment variables, the root's own
@@ -35,11 +46,13 @@ import (
 // merged into op.Variables by the time localRunDirect calls
 // collectDirTfvars. They rank only above a variable's own declared
 // default: they exist to fill gaps, not to compete with anything set at
-// the root/CLI level. See localRunDirect's merge of the two maps. Since a
-// folded-in directory's own variable is never renamed, a value for it
-// found in the ROOT's own terraform.tfvars/auto.tfvars (or -var) under
-// its plain, undecorated name already takes precedence correctly, with
-// no special-casing needed here.
+// the root/CLI level. See localRunDirect's merge of the two maps. To
+// override one specific folded-in directory's variable from the root
+// (rather than from that directory's own tfvars), the root's own
+// tfvars/-var must use that variable's final, namespaced name - the root
+// is the one place multiform can't shield from this internal detail,
+// since root-level overrides are inherently about reaching into one
+// specific directory from outside it.
 
 const (
 	multiformVarsFilename     = "terraform.tfvars"
@@ -52,13 +65,11 @@ func isMultiformAutoVarFile(name string) bool {
 
 // collectDirTfvars reads terraform.tfvars / terraform.tfvars.json /
 // *.auto.tfvars(.json) from every includes.conf-included directory that
-// declares at least one variable (see Module.KnownVariableDirs - this
-// has to be consulted rather than inferred from Module.Variables, since a
-// directory's variable declarations might have been entirely
-// deduplicated away in favor of an identical one kept from elsewhere),
-// and returns their values keyed by the plain variable name (never
-// renamed - see module.go's appendFile and cross_dir_dedup.go's
-// variablesEqual).
+// declares at least one variable (see Module.KnownVariableDirs), and
+// returns their values keyed by each variable's namespaced name (see
+// ReadDirTfvarsFiles). Since every directory's own namespace is unique,
+// there is no collision between directories here - each contributes a
+// disjoint set of keys to the merged result.
 func collectDirTfvars(mod *configs.Module) (map[string]backend.UnparsedVariableValue, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	ret := map[string]backend.UnparsedVariableValue{}
@@ -86,7 +97,11 @@ func collectDirTfvars(mod *configs.Module) (map[string]backend.UnparsedVariableV
 
 // ReadDirTfvarsFiles reads terraform.tfvars / terraform.tfvars.json /
 // *.auto.tfvars(.json) from a single directory and returns their values
-// keyed by plain attribute name. Exported for internal/command's
+// keyed by each attribute's namespaced name (see
+// configs.VariableNamespace - the same namespace applied to that
+// directory's variable declarations and references at parse time), so
+// the result lines up with that directory's variables' real, final names
+// in the flattened module. Exported for internal/command's
 // rootModuleCall (see meta_config.go), which falls back to this for a
 // folded-in directory's own required variable that has no value from any
 // other source: that early/static evaluation pipeline (used for provider
@@ -98,6 +113,7 @@ func collectDirTfvars(mod *configs.Module) (map[string]backend.UnparsedVariableV
 func ReadDirTfvarsFiles(dir string) (map[string]backend.UnparsedVariableValue, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	ret := map[string]backend.UnparsedVariableValue{}
+	namespace := configs.VariableNamespace(dir)
 
 	var files []string
 	if _, err := os.Stat(filepath.Join(dir, multiformVarsFilename)); err == nil {
@@ -115,7 +131,7 @@ func ReadDirTfvarsFiles(dir string) (map[string]backend.UnparsedVariableValue, t
 	}
 
 	for _, file := range files {
-		diags = diags.Append(addDirTfvarsFromFile(file, ret))
+		diags = diags.Append(addDirTfvarsFromFile(file, namespace, ret))
 	}
 
 	return ret, diags
@@ -123,8 +139,9 @@ func ReadDirTfvarsFiles(dir string) (map[string]backend.UnparsedVariableValue, t
 
 // addDirTfvarsFromFile parses filename (native HCL syntax or JSON, matching
 // the rules internal/command's own addVarsFromFile uses) and adds each of
-// its top-level attributes to "to", keyed by its plain attribute name.
-func addDirTfvarsFromFile(filename string, to map[string]backend.UnparsedVariableValue) tfdiags.Diagnostics {
+// its top-level attributes to "to", keyed by namespace + "_" + its plain
+// attribute name (see ReadDirTfvarsFiles).
+func addDirTfvarsFromFile(filename string, namespace string, to map[string]backend.UnparsedVariableValue) tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 
 	src, err := os.ReadFile(filename)
@@ -155,7 +172,7 @@ func addDirTfvarsFromFile(filename string, to map[string]backend.UnparsedVariabl
 	diags = diags.Append(hclDiags)
 
 	for name, attr := range attrs {
-		to[name] = unparsedVariableValueDirExpr{expr: attr.Expr}
+		to[namespace+"_"+name] = unparsedVariableValueDirExpr{expr: attr.Expr}
 	}
 
 	return diags

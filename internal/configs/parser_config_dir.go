@@ -60,9 +60,9 @@ func (p *Parser) LoadConfigDirSelective(path string, call StaticModuleCall, load
 		return nil, diags
 	}
 
-	primary, fDiags := p.loadFiles(primaryPaths, false)
+	primary, fDiags := p.loadFiles(primaryPaths, false, path)
 	diags = append(diags, fDiags...)
-	override, fDiags := p.loadFiles(overridePaths, true)
+	override, fDiags := p.loadFiles(overridePaths, true, path)
 	diags = append(diags, fDiags...)
 
 	mod, modDiags := NewModule(primary, override, call, path, load)
@@ -92,9 +92,9 @@ func (p *Parser) LoadConfigDirUneval(path string, load SelectiveLoader) (*Module
 		return nil, diags
 	}
 
-	primary, fDiags := p.loadFiles(primaryPaths, false)
+	primary, fDiags := p.loadFiles(primaryPaths, false, path)
 	diags = append(diags, fDiags...)
-	override, fDiags := p.loadFiles(overridePaths, true)
+	override, fDiags := p.loadFiles(overridePaths, true, path)
 	diags = append(diags, fDiags...)
 
 	mod, modDiags := NewModuleUneval(primary, override, path, load)
@@ -119,9 +119,9 @@ func (p *Parser) LoadConfigDirWithTests(path string, testDirectory string, call 
 		return nil, diags
 	}
 
-	primary, fDiags := p.loadFiles(primaryPaths, false)
+	primary, fDiags := p.loadFiles(primaryPaths, false, path)
 	diags = append(diags, fDiags...)
-	override, fDiags := p.loadFiles(overridePaths, true)
+	override, fDiags := p.loadFiles(overridePaths, true, path)
 	diags = append(diags, fDiags...)
 	tests, fDiags := p.loadTestFiles(path, testPaths)
 	diags = append(diags, fDiags...)
@@ -165,17 +165,29 @@ func (p *Parser) IsConfigDir(path string) bool {
 	return (len(primaryPaths) + len(overridePaths)) > 0
 }
 
-func (p *Parser) loadFiles(paths []string, override bool) ([]*File, hcl.Diagnostics) {
+// loadFiles loads each of paths as a config file. rootDir is the directory
+// of the module being loaded (not necessarily the same as any individual
+// path's own directory): a path whose directory differs from rootDir
+// belongs to a directory folded in via includes.conf, and has its
+// variable declarations and references namespaced to that directory (see
+// variable_namespacing.go) before being parsed into a *File.
+func (p *Parser) loadFiles(paths []string, override bool, rootDir string) ([]*File, hcl.Diagnostics) {
 	var files []*File
 	var diags hcl.Diagnostics
+	cleanRootDir := filepath.Clean(rootDir)
 
 	for _, path := range paths {
+		namespace := ""
+		if dir := filepath.Dir(path); dir != cleanRootDir {
+			namespace = VariableNamespace(dir)
+		}
+
 		var f *File
 		var fDiags hcl.Diagnostics
 		if override {
-			f, fDiags = p.LoadConfigFileOverride(path)
+			f, fDiags = p.loadConfigFileNamespaced(path, true, namespace)
 		} else {
-			f, fDiags = p.LoadConfigFile(path)
+			f, fDiags = p.loadConfigFileNamespaced(path, false, namespace)
 		}
 		diags = append(diags, fDiags...)
 		if f != nil {

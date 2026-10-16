@@ -54,9 +54,22 @@ func (p *Parser) LoadTestFile(path string) (*TestFile, hcl.Diagnostics) {
 }
 
 func (p *Parser) loadConfigFile(path string, override bool) (*File, hcl.Diagnostics) {
+	return p.loadConfigFileNamespaced(path, override, "")
+}
+
+// loadConfigFileNamespaced is loadConfigFile, but if namespace is
+// non-empty, every variable declaration and var.X reference in the file
+// is first namespaced (see variable_namespacing.go) - used for a file
+// belonging to a directory folded in via includes.conf, so its variables
+// can never collide with another folded-in directory's (or root's) same-
+// named variables.
+func (p *Parser) loadConfigFileNamespaced(path string, override bool, namespace string) (*File, hcl.Diagnostics) {
 	body, diags := p.LoadHCLFile(path)
 	if body == nil {
 		return nil, diags
+	}
+	if namespace != "" {
+		namespaceFoldedInFile(body, namespace)
 	}
 	ret, moreDiags := loadConfigFileBody(body, path, override)
 	diags = append(diags, moreDiags...)
