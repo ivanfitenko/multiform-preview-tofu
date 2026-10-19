@@ -1,0 +1,4 @@
+# Build outputs - regenerated locally by anyone building the provider,
+# never meant to be committed.
+cmd/terraform-provider-multiform/terraform-provider-multiform
+cmd/terraform-provider-multiform/multiform
