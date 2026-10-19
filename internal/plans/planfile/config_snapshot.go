@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"path"
 	"sort"
 	"strings"
 	"time"
@@ -64,16 +63,25 @@ func readConfigSnapshot(z *zip.Reader) (*configload.Snapshot, error) {
 
 		case strings.HasPrefix(file.Name, configSnapshotModulePrefix):
 			relName := file.Name[len(configSnapshotModulePrefix):]
-			moduleKey, fileName := path.Split(relName)
 
-			// moduleKey should currently have a trailing slash on it, which we
-			// can use to recognize the difference between the root module
-			// (just a trailing slash) and no module path at all (empty string).
-			if moduleKey == "" {
+			// The module key (never containing "/" - real module keys are
+			// "."-separated, e.g. "module.foo.module.bar") is everything up
+			// to the *first* slash, not the last: a module's own fileName
+			// can itself contain further slashes, since multiform's
+			// includes.conf folding can merge several real directories'
+			// files into one module, each keyed by its path relative to
+			// that module's own directory (see configload's
+			// addModuleToSnapshot). Splitting on the last slash instead
+			// (as path.Split does) would misinterpret a folded-in
+			// directory's name, like "sample2" in "sample2/main.tf", as a
+			// nested module key of its own.
+			idx := strings.IndexByte(relName, '/')
+			if idx < 0 {
 				// ignore invalid config entry
 				continue
 			}
-			moduleKey = moduleKey[:len(moduleKey)-1] // trim trailing slash
+			moduleKey := relName[:idx]
+			fileName := relName[idx+1:]
 
 			r, err := file.Open()
 			if err != nil {
