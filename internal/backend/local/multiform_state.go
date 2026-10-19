@@ -3,6 +3,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/zclconf/go-cty/cty"
@@ -15,6 +16,52 @@ import (
 	"github.com/opentofu/opentofu/internal/tfdiags"
 	"github.com/opentofu/opentofu/internal/tofu"
 )
+
+// globalStateFileEnvVar, when set, names a plain local file that stands in
+// for the "global"/primary role's state manager (see StateMgr below)
+// instead of whatever this run's real backend.tf declares. This is
+// internal plumbing used only by terraform-provider-multiform (which sets
+// it for its inner multiform subprocess) - never by a human directly, and
+// never read by configs.multiformConfig (use_states/preferred_state
+// themselves are unaffected and keep meaning exactly what they already
+// mean; only WHERE the global role's bytes physically live changes).
+//
+// Without this, driving multiform as a provider's inner subprocess would
+// need its own separate, independently-configured backend.tf for the
+// global role, living only inside root_dir - a second, genuinely separate
+// on-disk artifact alongside the outer Terraform project's own state for
+// the wrapping multiform_stack resource, with every opportunity for the
+// two to drift out of sync that implies (particularly for `state pull`/
+// `state push`, which the outer caller would naturally expect to operate
+// on "the" state, not have to know to reach into root_dir for a second
+// one). Instead, the provider stashes the global role's bytes as part of
+// its own outer resource's state (the same private-state mechanism it
+// already uses to stash a computed plan between ModifyPlan and Update),
+// writing them out to a temp file at this path before each subprocess
+// call and reading the (possibly updated) file back afterward.
+const globalStateFileEnvVar = "MULTIFORM_GLOBAL_STATE_FILE"
+
+// primaryStateMgr resolves the state manager for this run's own
+// "global"/primary role - ordinarily just b.StateMgr (whatever backend.tf
+// declares), but see globalStateFileEnvVar's own doc comment above: when
+// it's set, a plain local file at that path is used instead.
+//
+// This must NOT be folded into b.StateMgr itself (b's own method on
+// *Local, shared by every instance of this type): instantiateKnownBackend
+// above also constructs fresh *Local instances whenever a folded-in
+// directory's own backend.tf happens to declare a "local" backend too
+// (exactly what this project's own sample_tf test bed does) - if the env
+// var check lived in StateMgr, it would also hijack those per-directory
+// backends onto this same single override file, clobbering each other.
+// This helper is called only at localRun's own, single root-level
+// resolution point, which is never reached by instantiateKnownBackend's
+// separately-constructed backends.
+func (b *Local) primaryStateMgr(ctx context.Context, workspace string) (statemgr.Full, error) {
+	if path := os.Getenv(globalStateFileEnvVar); path != "" {
+		return statemgr.NewFilesystem(path, b.encryption), nil
+	}
+	return b.StateMgr(ctx, workspace)
+}
 
 // instantiateKnownBackend builds and configures a backend.Backend for one
 // of a module's KnownBackends entries (a backend block folded in from an

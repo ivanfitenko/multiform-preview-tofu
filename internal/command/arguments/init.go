@@ -52,15 +52,21 @@ type Init struct {
 	Backend *Backend
 	// State is used for the state related flags
 	State *State
+
+	// Multiform holds multiform's own state-handling/directory-folding flags
+	// (init needs -includes at minimum, to discover included directories'
+	// own module/provider requirements).
+	Multiform *Multiform
 }
 
 // BindInit registers CLI arguments, returning a Init value and it's corresponding hooks.
 func BindInit(cli *CommandLine) *Init {
 	init := Init{
-		View:    BindView(cli, viewFlagAll),
-		Vars:    BindVars(cli),
-		State:   BindState(cli, stateFlagLock),
-		Backend: BindBackendWithMigration(cli),
+		View:      BindView(cli, viewFlagAll),
+		Vars:      BindVars(cli),
+		State:     BindState(cli, stateFlagLock),
+		Backend:   BindBackendWithMigration(cli),
+		Multiform: BindMultiform(cli),
 
 		FlagConfigExtra: flagspkg.NewRawFlags("-backend-config"),
 	}

@@ -21,6 +21,9 @@ type Apply struct {
 	Operation *Operation
 	Vars      *Vars
 
+	// Multiform holds multiform's own state-handling/directory-folding flags.
+	Multiform *Multiform
+
 	// AutoApprove skips the manual verification step for the apply operation.
 	AutoApprove bool
 
@@ -45,6 +48,7 @@ func bindApply(cli *CommandLine, withLinting bool) *Apply {
 		Operation: BindOperation(cli),
 		Vars:      BindVars(cli),
 		State:     BindState(cli, stateFlagAll),
+		Multiform: BindMultiform(cli),
 	}
 
 	cli.BoolVar(&apply.AutoApprove, "auto-approve", false, "Skip interactive approval of plan before applying.")

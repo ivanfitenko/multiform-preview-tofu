@@ -51,7 +51,7 @@ func (b *Local) localRun(ctx context.Context, stopCtx context.Context, op *backe
 
 	// Get the latest state.
 	log.Printf("[TRACE] backend/local: requesting state manager for workspace %q", op.Workspace)
-	s, err := b.StateMgr(ctx, op.Workspace)
+	s, err := b.primaryStateMgr(ctx, op.Workspace)
 	if err != nil {
 		diags = diags.Append(fmt.Errorf("error loading state: %w", err))
 		return nil, nil, nil, diags

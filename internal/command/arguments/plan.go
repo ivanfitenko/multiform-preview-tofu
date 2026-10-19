@@ -19,6 +19,9 @@ type Plan struct {
 	Operation *Operation
 	Vars      *Vars
 
+	// Multiform holds multiform's own state-handling/directory-folding flags.
+	Multiform *Multiform
+
 	// DetailedExitCode enables different exit codes for error, success with
 	// changes, and success with no changes.
 	DetailedExitCode bool
@@ -42,6 +45,7 @@ func BindPlan(cli *CommandLine) *Plan {
 		Operation: BindOperation(cli),
 		Vars:      BindVars(cli),
 		State:     BindState(cli, stateFlagAll),
+		Multiform: BindMultiform(cli),
 	}
 
 	cli.BoolVar(&plan.DetailedExitCode, "detailed-exitcode", false,

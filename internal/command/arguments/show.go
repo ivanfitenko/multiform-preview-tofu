@@ -23,6 +23,14 @@ type Show struct {
 	View *View
 
 	Vars *Vars
+
+	// Multiform holds multiform's own state-handling/directory-folding
+	// flags. These aren't captured into a saved plan file's config
+	// snapshot (see internal/configs/multiform_config.go) - replaying
+	// one via `show <planfile>` needs the same -includes/-use-states/
+	// -preferred-state given to the original `plan` call, or the
+	// replayed config won't match what's actually in the plan file.
+	Multiform *Multiform
 }
 
 // ShowTargetType represents the type of object that is requested to be
@@ -63,8 +71,9 @@ const (
 // BindShow registers CLI arguments, returning a Show value and it's corresponding hooks.
 func BindShow(cli *CommandLine) *Show {
 	show := Show{
-		View: BindView(cli, viewFlagNoInput|viewFlagSensitive),
-		Vars: BindVars(cli),
+		View:      BindView(cli, viewFlagNoInput|viewFlagSensitive),
+		Vars:      BindVars(cli),
+		Multiform: BindMultiform(cli),
 	}
 
 	targetFlagGroup := FlagGroup{

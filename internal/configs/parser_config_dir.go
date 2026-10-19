@@ -73,7 +73,7 @@ func (p *Parser) LoadConfigDirSelective(path string, load SelectiveLoader) (*Mod
 	diags = append(diags, modDiags...)
 
 	if mod != nil {
-		useStates, preferredState, mcDiags := p.multiformConfig(path)
+		useStates, preferredState, mcDiags := p.multiformConfig()
 		diags = append(diags, mcDiags...)
 		mod.UseStates = useStates
 		mod.PreferredState = preferredState
@@ -102,7 +102,7 @@ func (p *Parser) LoadConfigDirWithTests(path string, testDirectory string) (*Mod
 	diags = append(diags, modDiags...)
 
 	if mod != nil {
-		useStates, preferredState, mcDiags := p.multiformConfig(path)
+		useStates, preferredState, mcDiags := p.multiformConfig()
 		diags = append(diags, mcDiags...)
 		mod.UseStates = useStates
 		mod.PreferredState = preferredState
@@ -336,26 +336,29 @@ func (p *Parser) classifyDirEntries(dir string, infos []os.FileInfo, includeTest
 	return primary, override, tests, symbols
 }
 
-// includesConfFile is the name of the file, if present in a configuration
-// directory, that lists additional directories (one per line, relative to
-// that directory) whose configuration files should implicitly be folded
-// into this one.
-const includesConfFile = "includes.conf"
+// IncludesEnvVar is the environment variable that lists additional
+// directories (one per line, relative to the root configuration directory)
+// whose configuration files should implicitly be folded into it - an
+// unconditional, live-read override with the same semantics as
+// MULTIFORM_USE_STATES/MULTIFORM_PREFERRED_STATE (see multiform_config.go):
+// internal/command/arguments sets it from the -includes CLI flag, and
+// terraform-provider-multiform sets it directly for its inner binary.
+const IncludesEnvVar = "MULTIFORM_INCLUDES"
 
-// includedDirs reads dir's includes.conf file, if any, and returns the
-// resolved paths of the directories it lists. Blank lines and lines
-// starting with '#' are ignored. If includes.conf does not exist, it
-// returns nil.
+// includedDirs reads the MULTIFORM_INCLUDES environment variable, if set,
+// and returns the resolved paths of the directories it lists, relative to
+// dir. Blank lines are ignored. If the environment variable is unset or
+// empty, it returns nil.
 func (p *Parser) includedDirs(dir string) []string {
-	raw, err := p.fs.ReadFile(filepath.Join(dir, includesConfFile))
-	if err != nil {
+	raw := os.Getenv(IncludesEnvVar)
+	if raw == "" {
 		return nil
 	}
 
 	var dirs []string
-	for _, line := range strings.Split(string(raw), "\n") {
+	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
 			continue
 		}
 		dirs = append(dirs, filepath.Join(dir, line))

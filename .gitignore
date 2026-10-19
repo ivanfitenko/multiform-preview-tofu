@@ -19,6 +19,7 @@ website/node_modules
 *.iml
 
 /tofu
+/cmd/tofu/multiform
 
 website/vendor
 vendor/
