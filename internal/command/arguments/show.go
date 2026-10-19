@@ -24,6 +24,14 @@ type Show struct {
 
 	Vars *Vars
 
+	// Multiform holds multiform's own state-handling/directory-folding
+	// flags. These aren't captured into a saved plan file's config
+	// snapshot (see internal/configs/multiform_config.go) - replaying
+	// one via `show <planfile>` needs the same -includes/-use-states/
+	// -preferred-state given to the original `plan` call, or the
+	// replayed config won't match what's actually in the plan file.
+	Multiform *Multiform
+
 	// ShowSensitive is used to display the value of variables marked as sensitive.
 	ShowSensitive bool
 }
@@ -69,7 +77,8 @@ const (
 func ParseShow(args []string) (*Show, func(), tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	show := &Show{
-		Vars: &Vars{},
+		Vars:      &Vars{},
+		Multiform: &Multiform{},
 	}
 
 	var stateTarget bool
@@ -82,6 +91,7 @@ func ParseShow(args []string) (*Show, func(), tfdiags.Diagnostics) {
 	cmdFlags.StringVar(&planTarget, "plan", "", "show the plan from a saved plan file")
 	cmdFlags.BoolVar(&configTarget, "config", false, "show the current configuration")
 	cmdFlags.StringVar(&moduleTarget, "module", "", "show metadata about one module")
+	show.Multiform.AddFlags(cmdFlags)
 
 	show.ViewOptions.AddFlags(cmdFlags, false)
 
@@ -92,6 +102,7 @@ func ParseShow(args []string) (*Show, func(), tfdiags.Diagnostics) {
 			err.Error(),
 		))
 	}
+	show.Multiform.Apply()
 
 	closer, moreDiags := show.ViewOptions.Parse()
 	diags = diags.Append(moreDiags)

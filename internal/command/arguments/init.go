@@ -50,6 +50,11 @@ type Init struct {
 	// Backend holds and providers information for the flags related to the backend operations, like locking
 	// locking timeout, force migration, etc.
 	Backend *Backend
+
+	// Multiform holds multiform's own state-handling/directory-folding flags
+	// (init needs -includes at minimum, to discover included directories'
+	// own module/provider requirements).
+	Multiform *Multiform
 }
 
 // ParseInit processes CLI arguments, returning an Init value, a closer function, and errors.
@@ -60,10 +65,12 @@ func ParseInit(args []string) (*Init, func(), tfdiags.Diagnostics) {
 	init := &Init{
 		Vars:            &Vars{},
 		Backend:         &Backend{},
+		Multiform:       &Multiform{},
 		FlagConfigExtra: flags.NewRawFlags("-backend-config"),
 	}
 
 	cmdFlags := extendedFlagSet("init", nil, nil, init.Vars)
+	init.Multiform.AddFlags(cmdFlags)
 	init.Backend.AddIgnoreRemoteVersionFlag(cmdFlags)
 	init.Backend.AddStateFlags(cmdFlags)
 	init.Backend.AddMigrationFlags(cmdFlags)
@@ -86,6 +93,7 @@ func ParseInit(args []string) (*Init, func(), tfdiags.Diagnostics) {
 			err.Error(),
 		))
 	}
+	init.Multiform.Apply()
 
 	closer, moreDiags := init.ViewOptions.Parse()
 	diags = diags.Append(moreDiags)

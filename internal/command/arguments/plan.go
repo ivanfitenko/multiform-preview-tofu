@@ -16,6 +16,9 @@ type Plan struct {
 	Operation *Operation
 	Vars      *Vars
 
+	// Multiform holds multiform's own state-handling/directory-folding flags.
+	Multiform *Multiform
+
 	// DetailedExitCode enables different exit codes for error, success with
 	// changes, and success with no changes.
 	DetailedExitCode bool
@@ -44,6 +47,7 @@ func ParsePlan(args []string) (*Plan, func(), tfdiags.Diagnostics) {
 		State:     &State{},
 		Operation: &Operation{},
 		Vars:      &Vars{},
+		Multiform: &Multiform{},
 	}
 
 	cmdFlags := extendedFlagSet("plan", plan.State, plan.Operation, plan.Vars)
@@ -51,6 +55,7 @@ func ParsePlan(args []string) (*Plan, func(), tfdiags.Diagnostics) {
 	cmdFlags.StringVar(&plan.OutPath, "out", "", "out")
 	cmdFlags.StringVar(&plan.GenerateConfigPath, "generate-config-out", "", "generate-config-out")
 	cmdFlags.BoolVar(&plan.ShowSensitive, "show-sensitive", false, "displays sensitive values")
+	plan.Multiform.AddFlags(cmdFlags)
 
 	plan.ViewOptions.AddFlags(cmdFlags, true)
 
@@ -61,6 +66,7 @@ func ParsePlan(args []string) (*Plan, func(), tfdiags.Diagnostics) {
 			err.Error(),
 		))
 	}
+	plan.Multiform.Apply()
 
 	args = cmdFlags.Args()
 

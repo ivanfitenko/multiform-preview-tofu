@@ -16,6 +16,9 @@ type Refresh struct {
 	Operation *Operation
 	Vars      *Vars
 
+	// Multiform holds multiform's own state-handling/directory-folding flags.
+	Multiform *Multiform
+
 	// ViewOptions specifies which view options to use
 	ViewOptions ViewOptions
 }
@@ -29,9 +32,11 @@ func ParseRefresh(args []string) (*Refresh, func(), tfdiags.Diagnostics) {
 		State:     &State{},
 		Operation: &Operation{},
 		Vars:      &Vars{},
+		Multiform: &Multiform{},
 	}
 
 	cmdFlags := extendedFlagSet("refresh", refresh.State, refresh.Operation, refresh.Vars)
+	refresh.Multiform.AddFlags(cmdFlags)
 	refresh.ViewOptions.AddFlags(cmdFlags, true)
 
 	if err := cmdFlags.Parse(args); err != nil {
@@ -41,6 +46,7 @@ func ParseRefresh(args []string) (*Refresh, func(), tfdiags.Diagnostics) {
 			err.Error(),
 		))
 	}
+	refresh.Multiform.Apply()
 
 	args = cmdFlags.Args()
 	if len(args) > 0 {

@@ -19,6 +19,9 @@ type Apply struct {
 	Operation *Operation
 	Vars      *Vars
 
+	// Multiform holds multiform's own state-handling/directory-folding flags.
+	Multiform *Multiform
+
 	// AutoApprove skips the manual verification step for the apply operation.
 	AutoApprove bool
 
@@ -45,12 +48,14 @@ func ParseApply(args []string) (*Apply, func(), tfdiags.Diagnostics) {
 		State:     &State{},
 		Operation: &Operation{},
 		Vars:      &Vars{},
+		Multiform: &Multiform{},
 	}
 
 	cmdFlags := extendedFlagSet("apply", apply.State, apply.Operation, apply.Vars)
 	cmdFlags.BoolVar(&apply.AutoApprove, "auto-approve", false, "auto-approve")
 	cmdFlags.BoolVar(&apply.ShowSensitive, "show-sensitive", false, "displays sensitive values")
 	cmdFlags.BoolVar(&apply.SuppressForgetErrorsDuringDestroy, "suppress-forget-errors", false, "suppress errors in destroy mode due to resources being forgotten")
+	apply.Multiform.AddFlags(cmdFlags)
 
 	apply.ViewOptions.AddFlags(cmdFlags, true)
 
@@ -61,6 +66,7 @@ func ParseApply(args []string) (*Apply, func(), tfdiags.Diagnostics) {
 			err.Error(),
 		))
 	}
+	apply.Multiform.Apply()
 
 	args = cmdFlags.Args()
 	if len(args) > 0 {
