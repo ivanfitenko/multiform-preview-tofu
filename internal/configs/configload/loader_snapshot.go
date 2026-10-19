@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	version "github.com/hashicorp/go-version"
@@ -191,7 +192,23 @@ func (l *loader) addModuleToSnapshot(snap *Snapshot, key string, dir string, sou
 	files = append(files, symbolFiles...)
 	sources := l.Sources() // should be populated with all the files we need by now
 	for _, filePath := range files {
-		filename := filepath.Base(filePath)
+		// Keyed by path relative to this module's own directory, not by
+		// bare filename: multiform's includes.conf folding can merge
+		// several real directories' files into this one module, and
+		// those directories routinely share filenames (every folded-in
+		// directory conventionally has its own main.tf/variables.tf/
+		// etc.) - keying by filename alone silently collapsed every
+		// same-named file from different folded-in directories onto a
+		// single map entry, discarding all but the last one. For a
+		// plain (non-multiform) file directly inside dir, this relative
+		// path is identical to the old bare filename, so this is not a
+		// behavior change for ordinary modules.
+		relPath, relErr := filepath.Rel(dir, filePath)
+		if relErr != nil {
+			relPath = filepath.Base(filePath)
+		}
+		relPath = filepath.Clean(relPath)
+
 		src, exists := sources[filePath]
 		if !exists {
 			diags = append(diags, &hcl.Diagnostic{
@@ -201,8 +218,18 @@ func (l *loader) addModuleToSnapshot(snap *Snapshot, key string, dir string, sou
 			})
 			continue
 		}
-		snapMod.Files[filepath.Clean(filename)] = src.Bytes
+		snapMod.Files[relPath] = src.Bytes
 	}
+
+	// Multiform's includes.conf (which directories to fold in) and
+	// config.cfg (use_states/preferred_state) directives are now read
+	// live from MULTIFORM_INCLUDES/MULTIFORM_USE_STATES/
+	// MULTIFORM_PREFERRED_STATE (see parser_config_dir.go's includedDirs,
+	// multiform_config.go's multiformConfig) rather than from files, so
+	// there is nothing of theirs left to snapshot here: like any other
+	// environment-variable-driven setting, if they differ between
+	// `plan -out=` and a later `apply <planfile>`, that's caught by the
+	// normal saved-plan-doesn't-match-configuration staleness check.
 
 	snap.Modules[key] = snapMod
 
@@ -263,13 +290,14 @@ func (fs snapshotFS) Open(name string) (afero.File, error) {
 	// module directory itself, in which case we'll return a snapshotDir
 	// instead.
 	//
-	// This function doesn't try to be incredibly robust in supporting
-	// different permutations of paths, etc because in practice we only
-	// need to support the path forms that our own loader and parser will
-	// generate.
-
-	dir := filepath.Dir(name)
-	fn := filepath.Base(name)
+	// A module's own Files map can itself contain multiple levels of
+	// virtual subdirectory (see addModuleToSnapshot's comment about
+	// multiform's includes.conf folding several real directories'
+	// files into one module, each file keyed by its path relative to
+	// the module's own Dir) - so beyond the exact-module-directory case
+	// below, resolving a name also means checking every module to see
+	// if name falls *inside* it, not just whether name matches some
+	// module's Dir exactly.
 	directDir := filepath.Clean(name)
 
 	// First we'll check to see if this is an exact path for a module directory.
@@ -277,33 +305,58 @@ func (fs snapshotFS) Open(name string) (afero.File, error) {
 	// because a module in a child directory of another module can otherwise
 	// appear to be a file in that parent directory.
 	if candidate, ok := fs.byDir[directDir]; ok {
-		// We've matched the module directory itself
-		filenames := make([]string, 0, len(candidate.Files))
-		for n := range candidate.Files {
-			filenames = append(filenames, n)
+		return &snapshotDir{filenames: immediateChildren(candidate.Files, "")}, nil
+	}
+
+	for modDir, modSnap := range fs.byDir {
+		rel, err := filepath.Rel(modDir, directDir)
+		if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+			continue
 		}
-		sort.Strings(filenames)
-		return &snapshotDir{
-			filenames: filenames,
-		}, nil
+		rel = filepath.Clean(rel)
+
+		if src, exists := modSnap.Files[rel]; exists {
+			return &snapshotFile{src: src}, nil
+		}
+		if children := immediateChildren(modSnap.Files, rel); len(children) > 0 {
+			return &snapshotDir{filenames: children}, nil
+		}
 	}
 
-	// If we get here then the given path isn't a module directory exactly, so
-	// we'll treat it as a file path and try to find a module directory it
-	// could be located in.
-	modSnap, ok := fs.byDir[dir]
-	if !ok {
-		return nil, os.ErrNotExist
+	return nil, os.ErrNotExist
+}
+
+// immediateChildren returns the sorted base names of every entry in files
+// that is a direct child of the virtual directory named by prefix - which
+// may itself be nested arbitrarily deep, since files' keys are full paths
+// relative to their owning module's own directory, not bare filenames.
+// An empty prefix means the module's own top-level directory.
+func immediateChildren(files map[string][]byte, prefix string) []string {
+	seen := make(map[string]struct{})
+	for name := range files {
+		rel := name
+		if prefix != "" {
+			p := prefix + string(filepath.Separator)
+			if !strings.HasPrefix(name, p) {
+				continue
+			}
+			rel = name[len(p):]
+		}
+		if rel == "" {
+			continue
+		}
+		if i := strings.IndexRune(rel, filepath.Separator); i >= 0 {
+			rel = rel[:i]
+		}
+		seen[rel] = struct{}{}
 	}
 
-	src, exists := modSnap.Files[fn]
-	if !exists {
-		return nil, os.ErrNotExist
+	children := make([]string, 0, len(seen))
+	for c := range seen {
+		children = append(children, c)
 	}
-
-	return &snapshotFile{
-		src: src,
-	}, nil
+	sort.Strings(children)
+	return children
 }
 
 func (fs snapshotFS) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
