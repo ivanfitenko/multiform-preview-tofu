@@ -5,3 +5,8 @@
 .terraform.lock.hcl
 *.tfstate
 *.tfstate.*
+
+# Convenience symlink to the locally-built multiform binary - points
+# outside the repo checkout, never meant to be committed (same as the
+# old `tofu` symlink it replaced).
+/multiform
